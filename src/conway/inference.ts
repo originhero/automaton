@@ -26,17 +26,18 @@ interface InferenceClientOptions {
   lowComputeModel?: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
+  googleApiKey?: string;
   ollamaBaseUrl?: string;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
 }
 
-type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama";
+type InferenceBackend = "conway" | "openai" | "anthropic" | "google" | "ollama";
 
 export function createInferenceClient(
   options: InferenceClientOptions,
 ): InferenceClient {
-  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider } = options;
+  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, googleApiKey, ollamaBaseUrl, getModelProvider } = options;
   const httpClient = new ResilientHttpClient({
     baseTimeout: INFERENCE_TIMEOUT_MS,
     retryableStatuses: [429, 500, 502, 503, 504],
@@ -54,6 +55,7 @@ export function createInferenceClient(
     const backend = resolveInferenceBackend(model, {
       openaiApiKey,
       anthropicApiKey,
+      googleApiKey,
       ollamaBaseUrl,
       getModelProvider,
     });
@@ -93,6 +95,18 @@ export function createInferenceClient(
         tools,
         temperature: opts?.temperature,
         anthropicApiKey: anthropicApiKey as string,
+        httpClient,
+      });
+    }
+
+    if (backend === "google") {
+      return chatViaGoogle({
+        model,
+        tokenLimit,
+        messages,
+        tools,
+        temperature: opts?.temperature,
+        googleApiKey: googleApiKey as string,
         httpClient,
       });
     }
@@ -141,6 +155,201 @@ export function createInferenceClient(
   };
 }
 
+// ─── Google Gemini Backend ────────────────────────────────────────
+
+async function chatViaGoogle(params: {
+  model: string;
+  tokenLimit: number;
+  messages: ChatMessage[];
+  tools?: InferenceToolDefinition[];
+  temperature?: number;
+  googleApiKey: string;
+  httpClient: ResilientHttpClient;
+}): Promise<InferenceResponse> {
+  const transformed = transformMessagesForGoogle(params.messages);
+
+  const body: Record<string, unknown> = {
+    contents: transformed.contents,
+    generationConfig: {
+      maxOutputTokens: params.tokenLimit,
+      ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
+    },
+  };
+
+  if (transformed.systemInstruction) {
+    body.systemInstruction = transformed.systemInstruction;
+  }
+
+  if (params.tools && params.tools.length > 0) {
+    body.tools = [{
+      functionDeclarations: params.tools.map((tool) => ({
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+      })),
+    }];
+    body.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+  }
+
+  // Gemini API uses the model name in the URL path.
+  // SECURITY NOTE: The API key is passed as a query parameter because the Google
+  // generativelanguage.googleapis.com v1beta endpoint requires it for API key auth.
+  // This means the key may appear in server access logs and browser history.
+  // For production use, consider using OAuth2/service account credentials with the
+  // x-goog-api-key header instead, or use the Vertex AI endpoint which supports
+  // Bearer token auth. See: https://cloud.google.com/vertex-ai/docs/reference/rest
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${params.model}:generateContent?key=${params.googleApiKey}`;
+
+  const resp = await params.httpClient.request(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    timeout: INFERENCE_TIMEOUT_MS,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Inference error (google): ${resp.status}: ${text}`);
+  }
+
+  const data = await resp.json() as any;
+  const candidate = data.candidates?.[0];
+  if (!candidate) {
+    throw new Error("No candidate returned from Google Gemini API");
+  }
+
+  const parts = candidate.content?.parts || [];
+  const textParts = parts.filter((p: any) => p.text);
+  const functionCallParts = parts.filter((p: any) => p.functionCall);
+
+  const textContent = textParts.map((p: any) => p.text).join("\n").trim();
+
+  const toolCalls: InferenceToolCall[] | undefined =
+    functionCallParts.length > 0
+      ? functionCallParts.map((p: any, i: number) => ({
+          id: `call_google_${i}_${Date.now()}`,
+          type: "function" as const,
+          function: {
+            name: p.functionCall.name,
+            arguments: JSON.stringify(p.functionCall.args || {}),
+          },
+        }))
+      : undefined;
+
+  if (!textContent && !toolCalls?.length) {
+    throw new Error("No content returned from Google Gemini API");
+  }
+
+  const promptTokens = data.usageMetadata?.promptTokenCount || 0;
+  const completionTokens = data.usageMetadata?.candidatesTokenCount || 0;
+  const usage: TokenUsage = {
+    promptTokens,
+    completionTokens,
+    totalTokens: data.usageMetadata?.totalTokenCount || (promptTokens + completionTokens),
+  };
+
+  return {
+    id: data.modelVersion || "",
+    model: params.model,
+    message: {
+      role: "assistant",
+      content: textContent,
+      tool_calls: toolCalls,
+    },
+    toolCalls,
+    usage,
+    finishReason: normalizeGoogleFinishReason(candidate.finishReason),
+  };
+}
+
+function transformMessagesForGoogle(
+  messages: ChatMessage[],
+): { systemInstruction?: Record<string, unknown>; contents: Array<Record<string, unknown>> } {
+  const systemParts: string[] = [];
+  const contents: Array<Record<string, unknown>> = [];
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      if (msg.content) systemParts.push(msg.content);
+      continue;
+    }
+
+    if (msg.role === "user") {
+      contents.push({
+        role: "user",
+        parts: [{ text: msg.content || "" }],
+      });
+      continue;
+    }
+
+    if (msg.role === "assistant") {
+      const parts: Array<Record<string, unknown>> = [];
+      if (msg.content) {
+        parts.push({ text: msg.content });
+      }
+      for (const tc of msg.tool_calls || []) {
+        parts.push({
+          functionCall: {
+            name: tc.function.name,
+            args: parseToolArguments(tc.function.arguments),
+          },
+        });
+      }
+      if (parts.length === 0) parts.push({ text: "" });
+      contents.push({ role: "model", parts });
+      continue;
+    }
+
+    if (msg.role === "tool") {
+      contents.push({
+        role: "user",
+        parts: [{
+          functionResponse: {
+            name: msg.name || "unknown_function",
+            response: { result: msg.content },
+          },
+        }],
+      });
+    }
+  }
+
+  // Gemini API requires at least one content entry with role "user".
+  // If all messages were system-only, inject a minimal user turn.
+  if (contents.length === 0) {
+    contents.push({
+      role: "user",
+      parts: [{ text: "Begin." }],
+    });
+  }
+
+  // Gemini requires the first content to be role "user", not "model".
+  // If conversation history starts with an assistant message, prepend a user turn.
+  if (contents.length > 0 && (contents[0] as any).role === "model") {
+    contents.unshift({
+      role: "user",
+      parts: [{ text: "Continue." }],
+    });
+  }
+
+  return {
+    systemInstruction: systemParts.length > 0
+      ? { parts: [{ text: systemParts.join("\n\n") }] }
+      : undefined,
+    contents,
+  };
+}
+
+function normalizeGoogleFinishReason(reason: unknown): string {
+  if (typeof reason !== "string") return "stop";
+  switch (reason) {
+    case "STOP": return "stop";
+    case "MAX_TOKENS": return "length";
+    case "SAFETY": return "content_filter";
+    case "RECITATION": return "content_filter";
+    default: return "stop";
+  }
+}
+
 function formatMessage(
   msg: ChatMessage,
 ): Record<string, unknown> {
@@ -166,6 +375,7 @@ function resolveInferenceBackend(
   keys: {
     openaiApiKey?: string;
     anthropicApiKey?: string;
+    googleApiKey?: string;
     ollamaBaseUrl?: string;
     getModelProvider?: (modelId: string) => string | undefined;
   },
@@ -176,6 +386,7 @@ function resolveInferenceBackend(
     if (provider === "ollama" && keys.ollamaBaseUrl) return "ollama";
     if (provider === "anthropic" && keys.anthropicApiKey) return "anthropic";
     if (provider === "openai" && keys.openaiApiKey) return "openai";
+    if (provider === "google" && keys.googleApiKey) return "google";
     if (provider === "conway") return "conway";
     // provider unknown or key not configured — fall through to heuristics
   }
@@ -183,6 +394,7 @@ function resolveInferenceBackend(
   // Heuristic fallback (model not in registry yet)
   if (keys.anthropicApiKey && /^claude/i.test(model)) return "anthropic";
   if (keys.openaiApiKey && /^(gpt-[3-9]|gpt-4|gpt-5|o[1-9][-\s.]|o[1-9]$|chatgpt)/i.test(model)) return "openai";
+  if (keys.googleApiKey && /^gemini/i.test(model)) return "google";
   return "conway";
 
 }

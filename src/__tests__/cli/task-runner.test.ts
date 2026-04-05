@@ -107,4 +107,12 @@ describe("mapExitReason", () => {
     // dead is a valid terminal state — maps to sleeping
     expect(mapExitReason("dead", false, 5, 25)).toBe("sleeping");
   });
+
+  it("maps error state", () => {
+    expect(mapExitReason("error" as any, false, 5, 25)).toBe("error");
+  });
+
+  it("prioritizes error over timeout", () => {
+    expect(mapExitReason("error" as any, true, 5, 25)).toBe("error");
+  });
 });

@@ -244,6 +244,12 @@ Environment:
             maxTurnsPerCycle: options.maxTurns,
           };
 
+          // Wire credits tracker so inference costs are deducted from
+          // the virtual balance (fix: previously dead code)
+          const creditsTracker = (options.conway as any).__creditsTracker as
+            | { recordInferenceCost(p: { promptTokens: number; completionTokens: number; model: string; provider: string }): void }
+            | undefined;
+
           await runAgentLoop({
             identity: options.identity,
             config: taskConfig,
@@ -253,6 +259,20 @@ Environment:
             onTurnComplete: (turn) => {
               collectedTurns.push(turn);
               options.onTurn(turn);
+
+              // Deduct inference cost from virtual credit balance
+              if (creditsTracker && turn.costCents > 0) {
+                try {
+                  creditsTracker.recordInferenceCost({
+                    promptTokens: turn.tokenUsage?.promptTokens ?? 0,
+                    completionTokens: turn.tokenUsage?.completionTokens ?? 0,
+                    model: taskConfig.inferenceModel || "unknown",
+                    provider: "local",
+                  });
+                } catch {
+                  // Non-fatal — don't crash the agent loop over credit tracking
+                }
+              }
             },
           });
 
@@ -644,6 +664,23 @@ async function run(): Promise<void> {
           logger.info(
             `[${new Date().toISOString()}] Turn ${turn.id}: ${turn.toolCalls.length} tools, ${turn.tokenUsage.totalTokens} tokens`,
           );
+
+          // Deduct inference cost from virtual credit balance (local mode)
+          const ct = (conway as any).__creditsTracker as
+            | { recordInferenceCost(p: { promptTokens: number; completionTokens: number; model: string; provider: string }): void }
+            | undefined;
+          if (ct && turn.costCents > 0) {
+            try {
+              ct.recordInferenceCost({
+                promptTokens: turn.tokenUsage?.promptTokens ?? 0,
+                completionTokens: turn.tokenUsage?.completionTokens ?? 0,
+                model: config.inferenceModel || "unknown",
+                provider: "local",
+              });
+            } catch {
+              // Non-fatal
+            }
+          }
         },
       });
 

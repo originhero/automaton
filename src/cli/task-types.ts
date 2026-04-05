@@ -60,7 +60,10 @@ export interface TaskInput {
   context?: string;
   /** Session state from the previous cycle, or null for a fresh run. */
   session: TaskInputSession | null;
-  config: TaskInputConfig;
+  /** Optional config overrides. Defaults to {} if not provided by caller. */
+  config?: TaskInputConfig;
+  /** Top-level model override (used by Paperclip adapter). */
+  model?: string;
 }
 
 // ─── Task Output ──────────────────────────────────────────────────
@@ -93,7 +96,6 @@ const REQUIRED_FIELDS: (keyof TaskInput)[] = [
   "companyId",
   "prompt",
   "session",
-  "config",
 ];
 
 /**
@@ -114,6 +116,22 @@ export function parseTaskInput(raw: string): TaskInput {
         `TaskInput missing required field: "${field}"`
       );
     }
+  }
+
+  // Default config to empty object if not provided (Paperclip may omit it)
+  if (!("config" in parsed) || parsed.config == null) {
+    parsed.config = {};
+  }
+
+  // If a top-level `model` was provided but config.inferenceModel was not,
+  // propagate it into config so the runner picks it up.
+  const configObj = parsed.config as Record<string, unknown>;
+  if (
+    typeof parsed.model === "string" &&
+    (parsed.model as string).trim().length > 0 &&
+    !configObj.inferenceModel
+  ) {
+    configObj.inferenceModel = parsed.model;
   }
 
   return parsed as unknown as TaskInput;

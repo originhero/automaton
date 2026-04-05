@@ -30,7 +30,7 @@ const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
  * Parse CLI flags for the task subcommand.
  *
  *   --max-turns N   Maximum agent turns (default 25)
- *   --timeout N     Timeout in milliseconds (default 300000)
+ *   --timeout N     Timeout in seconds (default 300, i.e. 5 minutes)
  *   --json          Output JSON to stdout (default true, flag is explicit opt-in)
  */
 export function parseTaskArgs(argv: string[]): TaskCliArgs {
@@ -50,7 +50,9 @@ export function parseTaskArgs(argv: string[]): TaskCliArgs {
     } else if (arg === "--timeout" && i + 1 < argv.length) {
       const parsed = parseInt(argv[i + 1], 10);
       if (!Number.isNaN(parsed) && parsed > 0) {
-        timeoutMs = parsed;
+        // --timeout is specified in seconds (e.g. Paperclip sends 300 for 5 min);
+        // convert to milliseconds for internal use.
+        timeoutMs = parsed * 1000;
       }
       i++; // skip the value
     } else if (arg === "--json") {

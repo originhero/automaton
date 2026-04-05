@@ -112,6 +112,8 @@ export function mapExitReason(
   turnsExecuted: number,
   maxTurns: number,
 ): "completed" | "max_turns" | "timeout" | "error" | "sleeping" {
+  // Error state means the agent encountered a fatal error
+  if (finalState === "error") return "error";
   // Sleeping (or dead) means the agent chose to stop
   if (finalState === "sleeping" || finalState === "dead") return "sleeping";
   // Timeout takes precedence over max_turns
@@ -154,6 +156,12 @@ export function restoreSession(
 
 /**
  * Capture current session state from the database KV store.
+ *
+ * KNOWN LIMITATION: kvState is always empty because AutomatonDatabase does not
+ * expose a listKV() method. Keys written by the agent during its run are stored
+ * in the DB but cannot be enumerated here. The workdir is captured explicitly
+ * via the `__workdir__` sentinel key. A future AutomatonDatabase.listKV() API
+ * would allow full KV state capture.
  */
 export function captureSession(
   db: AutomatonDatabase,
@@ -208,16 +216,17 @@ export async function runTask(
   const { maxTurns, timeoutMs } = options;
 
   // ── 1. Apply config overrides from TaskInput ───────────────────
+  const inputConfig = input.config ?? {};
   const config: AutomatonConfig = {
     ...baseConfig,
-    ...(input.config.genesisPrompt !== undefined
-      ? { genesisPrompt: input.config.genesisPrompt }
+    ...(inputConfig.genesisPrompt !== undefined
+      ? { genesisPrompt: inputConfig.genesisPrompt }
       : {}),
-    ...(input.config.inferenceModel !== undefined
-      ? { inferenceModel: input.config.inferenceModel }
+    ...(inputConfig.inferenceModel !== undefined
+      ? { inferenceModel: inputConfig.inferenceModel }
       : {}),
-    ...(input.config.maxTurnsPerCycle !== undefined
-      ? { maxTurnsPerCycle: input.config.maxTurnsPerCycle }
+    ...(inputConfig.maxTurnsPerCycle !== undefined
+      ? { maxTurnsPerCycle: inputConfig.maxTurnsPerCycle }
       : {}),
     agentId: input.agentId,
   };
@@ -253,6 +262,12 @@ export async function runTask(
     onTurn: (turn) => collectedTurns.push(turn),
   });
 
+  // KNOWN LIMITATION: The timeout only races against the loop promise; it does
+  // not abort the underlying agent loop. The loop will continue running in the
+  // background until it finishes naturally. In practice, this is acceptable
+  // because the Paperclip adapter runs Automaton as a child process and kills
+  // the entire process tree when the timeout fires. Within a single process,
+  // a cooperative cancellation token would be needed to truly cancel the loop.
   if (timeoutMs > 0) {
     let timeoutHandle: ReturnType<typeof setTimeout>;
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -266,8 +281,10 @@ export async function runTask(
       loopResult = await Promise.race([loopPromise, timeoutPromise]);
     } catch (err) {
       if (timedOut) {
-        // Timeout — use what we have, treat finalState as "running"
-        loopResult = { turns: collectedTurns, finalState: "running" };
+        // Timeout — snapshot the collected turns so that any turns arriving
+        // after the timeout (from the still-running loop) don't mutate the
+        // result we're about to serialize.
+        loopResult = { turns: [...collectedTurns], finalState: "running" };
       } else {
         throw err;
       }

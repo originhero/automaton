@@ -40,6 +40,54 @@ describe("parseTaskInput", () => {
     expect(result.config).toEqual({});
   });
 
+  it("parses input without config field (Paperclip may omit it)", () => {
+    const raw = JSON.stringify({
+      runId: "run-003",
+      agentId: "agent-abc",
+      companyId: "company-xyz",
+      prompt: "No config sent",
+      session: null,
+    });
+
+    const result = parseTaskInput(raw);
+
+    expect(result.runId).toBe("run-003");
+    expect(result.config).toEqual({});
+  });
+
+  it("propagates top-level model into config.inferenceModel", () => {
+    const raw = JSON.stringify({
+      runId: "run-004",
+      agentId: "agent-abc",
+      companyId: "company-xyz",
+      prompt: "Model override",
+      session: null,
+      model: "gpt-4o",
+    });
+
+    const result = parseTaskInput(raw);
+
+    expect(result.model).toBe("gpt-4o");
+    expect(result.config!.inferenceModel).toBe("gpt-4o");
+  });
+
+  it("does not overwrite config.inferenceModel with top-level model", () => {
+    const raw = JSON.stringify({
+      runId: "run-005",
+      agentId: "agent-abc",
+      companyId: "company-xyz",
+      prompt: "Both model and config",
+      session: null,
+      model: "gpt-4o",
+      config: { inferenceModel: "claude-sonnet-4" },
+    });
+
+    const result = parseTaskInput(raw);
+
+    // config.inferenceModel takes precedence over top-level model
+    expect(result.config!.inferenceModel).toBe("claude-sonnet-4");
+  });
+
   it("parses input with session state", () => {
     const raw = JSON.stringify({
       runId: "run-002",
