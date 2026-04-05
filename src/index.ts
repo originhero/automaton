@@ -15,6 +15,8 @@ import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
 import { createConwayClient } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
+import { createClient as createClientFactory } from "./local/client-factory.js";
+import { getCreditsTracker } from "./local/index.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
   loadHeartbeatConfig,
@@ -29,7 +31,7 @@ import { createSocialClient } from "./social/client.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
-import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
+import type { AutomatonIdentity, AutomatonConfig, AgentState, AgentTurn, Skill, SocialClientInterface } from "./types.js";
 import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
@@ -57,6 +59,7 @@ Sovereign AI Agent Runtime
 
 Usage:
   automaton --run          Start the automaton (first run triggers setup wizard)
+  automaton task           Run a single task from stdin (Paperclip mode)
   automaton --setup        Re-run the interactive setup wizard
   automaton --configure    Edit configuration (providers, model, treasury, general)
   automaton --pick-model   Interactively pick the active inference model
@@ -129,6 +132,143 @@ Environment:
     process.exit(0);
   }
 
+  // ─── Task Subcommand (Paperclip mode) ────────────────────────
+  if (args[0] === "task") {
+    const { runTaskCli } = await import("./cli/task.js");
+
+    await runTaskCli(args.slice(1), async () => {
+      // Minimal boot: config, wallet, db, client, inference, identity
+      let config = loadConfig();
+      if (!config) {
+        throw new Error("Automaton is not configured. Run `automaton --setup` first.");
+      }
+
+      const { account, chainIdentity, chainType: walletChainType } = await getWallet();
+      const resolvedChainType = config.chainType || walletChainType || "evm";
+      const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
+      const isLocalMode = process.env.ORIGINHERO_MODE === "local";
+      if (!apiKey && !isLocalMode) {
+        throw new Error("No API key found. Run: automaton --provision (or set ORIGINHERO_MODE=local)");
+      }
+
+      const dbPath = resolvePath(config.dbPath);
+      const db = createDatabase(dbPath);
+
+      // Persist createdAt (same as run())
+      const existingCreatedAt = db.getIdentity("createdAt");
+      const createdAt = existingCreatedAt || new Date().toISOString();
+      if (!existingCreatedAt) {
+        db.setIdentity("createdAt", createdAt);
+      }
+
+      const identity: AutomatonIdentity = {
+        name: config.name,
+        address: chainIdentity.address,
+        account,
+        creatorAddress: config.creatorAddress,
+        sandboxId: config.sandboxId,
+        apiKey: apiKey || "",
+        createdAt,
+        chainType: resolvedChainType,
+        chainIdentity,
+      };
+
+      // Create client (same as run())
+      const { client: conway } = createClientFactory({
+        mode: (process.env.ORIGINHERO_MODE as any) || "auto",
+        conwayApiUrl: config.conwayApiUrl,
+        conwayApiKey: apiKey || undefined,
+        sandboxId: config.sandboxId,
+        db: db.raw,
+      });
+
+      // Create inference client (same as run())
+      const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
+      const modelRegistry = new ModelRegistry(db.raw);
+      modelRegistry.initialize();
+      const googleApiKey = process.env.GOOGLE_API_KEY || config.googleApiKey;
+
+      const providerKeys: Record<string, string | undefined> = {
+        openai: config.openaiApiKey,
+        anthropic: config.anthropicApiKey,
+        google: googleApiKey,
+        conway: apiKey || undefined,
+        ollama: ollamaBaseUrl,
+      };
+      for (const model of modelRegistry.getAll()) {
+        const hasKey = !!providerKeys[model.provider];
+        if (!hasKey && model.enabled) {
+          modelRegistry.setEnabled(model.modelId, false);
+        }
+      }
+
+      const inference = createInferenceClient({
+        apiUrl: config.conwayApiUrl,
+        apiKey: apiKey || "",
+        defaultModel: config.inferenceModel,
+        maxTokens: config.maxTokensPerTurn,
+        lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
+        openaiApiKey: config.openaiApiKey,
+        anthropicApiKey: config.anthropicApiKey,
+        googleApiKey,
+        ollamaBaseUrl,
+        getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
+      });
+
+      // Build the TaskRunnerDeps with a wrapper around the real runAgentLoop
+      return {
+        config,
+        db,
+        conway,
+        inference,
+        identity,
+        runAgentLoop: async (options) => {
+          const collectedTurns: AgentTurn[] = [];
+
+          // Inject the task input as an inbox message so the agent processes it.
+          // The real loop builds its own wakeup prompt for the first turn, then
+          // picks up inbox messages on subsequent turns.  By inserting the task
+          // prompt as a creator inbox message, the agent receives it.
+          db.insertInboxMessage({
+            id: randomUUID(),
+            from: config.creatorAddress,
+            to: identity.address,
+            content: options.input,
+            signedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+          });
+
+          // Override maxTurnsPerCycle so the real loop respects the task's limit
+          const taskConfig: AutomatonConfig = {
+            ...options.config,
+            maxTurnsPerCycle: options.maxTurns,
+          };
+
+          await runAgentLoop({
+            identity: options.identity,
+            config: taskConfig,
+            db: options.db,
+            conway: options.conway,
+            inference: options.inference,
+            onTurnComplete: (turn) => {
+              collectedTurns.push(turn);
+              options.onTurn(turn);
+            },
+          });
+
+          const finalState = db.getAgentState();
+
+          return {
+            turns: collectedTurns,
+            finalState,
+          };
+        },
+      };
+    });
+
+    process.exit(process.exitCode ?? 0);
+  }
+
   if (args.includes("--run")) {
     StructuredLogger.setSink(prettySink);
     await run();
@@ -197,8 +337,9 @@ async function run(): Promise<void> {
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
   const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
+  const isLocalMode = process.env.ORIGINHERO_MODE === "local";
+  if (!apiKey && !isLocalMode) {
+    logger.error("No API key found. Run: automaton --provision (or set ORIGINHERO_MODE=local)");
     process.exit(1);
   }
 
@@ -220,7 +361,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: apiKey || "",
     createdAt,
     chainType: resolvedChainType,
     chainIdentity,
@@ -238,14 +379,18 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
+  // Create Conway client — uses factory to select between Conway Cloud and Local
+  const { client: conway, mode: clientMode } = createClientFactory({
+    mode: (process.env.ORIGINHERO_MODE as any) || "auto",
+    conwayApiUrl: config.conwayApiUrl,
+    conwayApiKey: apiKey || undefined,
     sandboxId: config.sandboxId,
+    db: db.raw, // Pass raw better-sqlite3 instance for local mode
   });
+  logger.info(`[${new Date().toISOString()}] Client mode: ${clientMode}`);
 
   // Register automaton identity (one-time, immutable)
+  // In local mode, registration goes to SQLite instead of Conway Cloud.
   const registrationState = db.getIdentity("conwayRegistrationStatus");
   if (registrationState !== "registered") {
     try {
@@ -284,14 +429,33 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  const googleApiKey = process.env.GOOGLE_API_KEY || config.googleApiKey;
+
+  // Disable models whose provider has no API key configured.
+  // This ensures the InferenceRouter skips models it can't actually call.
+  const providerKeys: Record<string, string | undefined> = {
+    openai: config.openaiApiKey,
+    anthropic: config.anthropicApiKey,
+    google: googleApiKey,
+    conway: apiKey || undefined,
+    ollama: ollamaBaseUrl,
+  };
+  for (const model of modelRegistry.getAll()) {
+    const hasKey = !!providerKeys[model.provider];
+    if (!hasKey && model.enabled) {
+      modelRegistry.setEnabled(model.modelId, false);
+      logger.info(`[${new Date().toISOString()}] Disabled ${model.modelId} (no ${model.provider} API key)`);
+    }
+  }
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: apiKey || "",
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
+    googleApiKey,
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
@@ -337,35 +501,40 @@ async function run(): Promise<void> {
   }
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
-  // The agent decides larger topups itself via the topup_credits tool.
-  try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
-    });
+  // In local mode, credits are virtual — skip Conway topup.
+  if (clientMode === "conway") {
     try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-            chainType: resolvedChainType,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
+      let bootstrapTimer: ReturnType<typeof setTimeout>;
+      const bootstrapTimeout = new Promise<null>((_, reject) => {
+        bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+      });
+      try {
+        await Promise.race([
+          (async () => {
+            const creditsCents = await conway.getCreditsBalance().catch(() => 0);
+            const topupResult = await bootstrapTopup({
+              apiUrl: config.conwayApiUrl,
+              account,
+              creditsCents,
+              chainType: resolvedChainType,
+            });
+            if (topupResult?.success) {
+              logger.info(
+                `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
+              );
+            }
+          })(),
+          bootstrapTimeout,
+        ]);
+      } finally {
+        clearTimeout(bootstrapTimer!);
+      }
+    } catch (err: any) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
+  } else {
+    const localBalance = await conway.getCreditsBalance().catch(() => 0);
+    logger.info(`[${new Date().toISOString()}] Local mode — virtual credits: $${(localBalance / 100).toFixed(2)}`);
   }
 
   // Start heartbeat daemon (Phase 1.1: DurableScheduler)
@@ -387,9 +556,48 @@ async function run(): Promise<void> {
   heartbeat.start();
   logger.info(`[${new Date().toISOString()}] Heartbeat daemon started.`);
 
+  // ─── Dashboard API Server ───────────────────────────────────
+  const apiPort = parseInt(process.env.ORIGINHERO_API_PORT || "3001", 10);
+  let apiServer: import("http").Server | null = null;
+  let liveState = {
+    state: "waking" as string,
+    uptimeSeconds: 0,
+    creditsCents: 0,
+    survivalTier: "normal",
+    currentTurn: 0,
+  };
+  const startTime = Date.now();
+
+  try {
+    const { createAPIServer } = await import("./api/server.js");
+    apiServer = createAPIServer({
+      port: apiPort,
+      config,
+      db,
+      getState: () => ({
+        ...liveState,
+        uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
+      }),
+      onConfigUpdate: (updates) => {
+        Object.assign(config, updates);
+        // Persist updated config to disk
+        const { saveConfig } = require("./config.js");
+        saveConfig(config);
+        logger.info("Config updated from dashboard and saved to disk");
+      },
+      onCommand: (command) => {
+        insertWakeEvent(db.raw, "creator", command);
+        logger.info(`Command queued from dashboard: ${command.slice(0, 80)}`);
+      },
+    });
+  } catch (err) {
+    logger.warn(`Dashboard API failed to start (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // Handle graceful shutdown
   const shutdown = () => {
     logger.info(`[${new Date().toISOString()}] Shutting down...`);
+    if (apiServer) apiServer.close();
     heartbeat.stop();
     db.setAgentState("sleeping");
     db.close();
@@ -425,9 +633,14 @@ async function run(): Promise<void> {
         spendTracker,
         ollamaBaseUrl,
         onStateChange: (state: AgentState) => {
+          liveState.state = state;
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },
         onTurnComplete: (turn) => {
+          liveState.currentTurn++;
+          liveState.creditsCents = turn.costCents
+            ? (liveState.creditsCents - turn.costCents)
+            : liveState.creditsCents;
           logger.info(
             `[${new Date().toISOString()}] Turn ${turn.id}: ${turn.toolCalls.length} tools, ${turn.tokenUsage.totalTokens} tokens`,
           );
