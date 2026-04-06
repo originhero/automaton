@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { OpenAICompatibleProtocol } from "../../inference/protocols/openai-compatible.js";
-import type { Message, ChatOptions, FetchFn } from "../../inference/protocols/types.js";
+import type { Message, ChatOptions, FetchFn, ToolCall } from "../../inference/protocols/types.js";
 
 function createMockFetch(responseBody: unknown, status = 200): FetchFn {
   return vi.fn().mockResolvedValue({
@@ -194,6 +194,23 @@ describe("OpenAICompatibleProtocol", () => {
         protocol.chat([{ role: "user", content: "Hi" }], { model: "gpt-4o" }),
       ).rejects.toThrow(/401/);
     });
+
+    it("uses default timeout when no signal is provided", async () => {
+      const mockResponse = {
+        id: "chatcmpl-timeout",
+        model: "gpt-4o",
+        choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 1 },
+      };
+
+      const fetchFn = createMockFetch(mockResponse);
+      const protocol = new OpenAICompatibleProtocol({ baseUrl, apiKey, fetchFn });
+
+      await protocol.chat([{ role: "user", content: "Hi" }], { model: "gpt-4o" });
+
+      const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(init.signal).toBeDefined();
+    });
   });
 
   describe("chatStream()", () => {
@@ -220,6 +237,92 @@ describe("OpenAICompatibleProtocol", () => {
       expect(chunks[0].delta).toBe("Hello");
       expect(chunks[1].delta).toBe(" world");
       expect(chunks[2].finishReason).toBe("stop");
+    });
+
+    it("accumulates tool call arguments across SSE chunks (Bug J fix)", async () => {
+      const sseChunks = [
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"ci"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\\":\\"N"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"YC\\"}"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        "data: [DONE]\n\n",
+      ];
+
+      const fetchFn = createSSEFetch(sseChunks);
+      const protocol = new OpenAICompatibleProtocol({ baseUrl, apiKey, fetchFn });
+
+      const chunks: { delta: string; finishReason?: string; toolCalls?: ToolCall[] }[] = [];
+      for await (const chunk of protocol.chatStream!(
+        [{ role: "user", content: "Weather in NYC?" }],
+        { model: "gpt-4o" },
+      )) {
+        chunks.push(chunk);
+      }
+
+      // Should NOT yield incomplete tool calls in intermediate chunks
+      const toolChunks = chunks.filter(c => c.toolCalls && c.toolCalls.length > 0);
+      expect(toolChunks).toHaveLength(1);
+
+      // The accumulated tool call should have complete JSON arguments
+      const toolCall = toolChunks[0].toolCalls![0];
+      expect(toolCall.id).toBe("call_1");
+      expect(toolCall.function.name).toBe("get_weather");
+      expect(toolCall.function.arguments).toBe('{"city":"NYC"}');
+      expect(JSON.parse(toolCall.function.arguments)).toEqual({ city: "NYC" });
+    });
+
+    it("accumulates multiple tool calls across SSE chunks", async () => {
+      const sseChunks = [
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"NYC\\"}"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\\"tz\\":\\"EST\\"}"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        "data: [DONE]\n\n",
+      ];
+
+      const fetchFn = createSSEFetch(sseChunks);
+      const protocol = new OpenAICompatibleProtocol({ baseUrl, apiKey, fetchFn });
+
+      const chunks: { delta: string; finishReason?: string; toolCalls?: ToolCall[] }[] = [];
+      for await (const chunk of protocol.chatStream!(
+        [{ role: "user", content: "Weather and time?" }],
+        { model: "gpt-4o" },
+      )) {
+        chunks.push(chunk);
+      }
+
+      const toolChunks = chunks.filter(c => c.toolCalls && c.toolCalls.length > 0);
+      expect(toolChunks).toHaveLength(1);
+      expect(toolChunks[0].toolCalls).toHaveLength(2);
+      expect(toolChunks[0].toolCalls![0].function.name).toBe("get_weather");
+      expect(toolChunks[0].toolCalls![1].function.name).toBe("get_time");
+      expect(JSON.parse(toolChunks[0].toolCalls![1].function.arguments)).toEqual({ tz: "EST" });
+    });
+
+    it("throws when response body is null (Bug K fix)", async () => {
+      const fetchFn = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: null,
+      } as unknown as Response);
+
+      const protocol = new OpenAICompatibleProtocol({ baseUrl, apiKey, fetchFn });
+
+      const iterator = protocol.chatStream!(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o" },
+      );
+
+      await expect(async () => {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const _ of iterator) {
+          // should throw
+        }
+      }).rejects.toThrow(/response body is null/);
     });
   });
 

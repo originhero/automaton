@@ -22,6 +22,8 @@ import type {
   ToolCall,
 } from "./types.js";
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 export interface OpenAICompatibleConfig {
   baseUrl: string;
   apiKey: string;
@@ -64,7 +66,7 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: options.signal,
+      signal: options.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -114,7 +116,7 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: options.signal,
+      signal: options.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -124,9 +126,22 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
       );
     }
 
-    const reader = response.body!.getReader();
+    // Bug K fix: null check on response.body
+    if (!response.body) {
+      throw new Error("OpenAI-compatible streaming error: response body is null");
+    }
+
+    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+
+    // Bug J fix: accumulate tool call arguments across SSE chunks
+    const toolCallAccumulator: Map<number, {
+      id: string;
+      type: string;
+      name: string;
+      arguments: string;
+    }> = new Map();
 
     try {
       while (true) {
@@ -143,7 +158,28 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
           if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
           const data = trimmed.slice(6);
-          if (data === "[DONE]") return;
+          if (data === "[DONE]") {
+            // Emit any remaining accumulated tool calls
+            if (toolCallAccumulator.size > 0) {
+              const completedToolCalls: ToolCall[] = [];
+              for (const [, acc] of toolCallAccumulator) {
+                completedToolCalls.push({
+                  id: acc.id,
+                  type: "function" as const,
+                  function: {
+                    name: acc.name,
+                    arguments: acc.arguments,
+                  },
+                });
+              }
+              toolCallAccumulator.clear();
+              yield {
+                delta: "",
+                toolCalls: completedToolCalls,
+              };
+            }
+            return;
+          }
 
           let parsed: OpenAIStreamChunk;
           try {
@@ -155,19 +191,58 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
           const delta = parsed.choices?.[0]?.delta;
           const finishReason = parsed.choices?.[0]?.finish_reason ?? undefined;
 
-          const toolCalls: ToolCall[] | undefined = delta?.tool_calls?.map(tc => ({
-            id: tc.id ?? "",
-            type: tc.type ?? "function",
-            function: {
-              name: tc.function?.name ?? "",
-              arguments: tc.function?.arguments ?? "",
-            },
-          }));
+          // Bug J fix: accumulate tool call fragments instead of emitting partial ones
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const index = tc.index ?? 0;
+              const existing = toolCallAccumulator.get(index);
+              if (existing) {
+                // Append argument fragments
+                if (tc.function?.arguments) {
+                  existing.arguments += tc.function.arguments;
+                }
+                if (tc.function?.name) {
+                  existing.name += tc.function.name;
+                }
+              } else {
+                // Start a new tool call accumulator entry
+                toolCallAccumulator.set(index, {
+                  id: tc.id ?? "",
+                  type: tc.type ?? "function",
+                  name: tc.function?.name ?? "",
+                  arguments: tc.function?.arguments ?? "",
+                });
+              }
+            }
+          }
+
+          // When finish_reason signals tool_calls are done, emit all accumulated tool calls
+          if (finishReason === "tool_calls" || finishReason === "stop") {
+            if (toolCallAccumulator.size > 0) {
+              const completedToolCalls: ToolCall[] = [];
+              for (const [, acc] of toolCallAccumulator) {
+                completedToolCalls.push({
+                  id: acc.id,
+                  type: "function" as const,
+                  function: {
+                    name: acc.name,
+                    arguments: acc.arguments,
+                  },
+                });
+              }
+              toolCallAccumulator.clear();
+              yield {
+                delta: delta?.content ?? "",
+                finishReason,
+                toolCalls: completedToolCalls,
+              };
+              continue;
+            }
+          }
 
           yield {
             delta: delta?.content ?? "",
             finishReason: finishReason ?? undefined,
-            toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
           };
         }
       }
@@ -180,6 +255,7 @@ export class OpenAICompatibleProtocol implements InferenceProtocol {
     const response = await this.fetchFn(`${this.baseUrl}/models`, {
       method: "GET",
       headers: this.headers(),
+      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -269,6 +345,7 @@ interface OpenAIStreamChunk {
     delta: {
       content?: string;
       tool_calls?: Array<{
+        index?: number;
         id?: string;
         type?: string;
         function?: { name?: string; arguments?: string };

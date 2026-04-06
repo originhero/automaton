@@ -25,6 +25,8 @@ import type {
   ToolCall,
 } from "./types.js";
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 export interface AnthropicConfig {
   baseUrl: string;
   apiKey: string;
@@ -74,7 +76,7 @@ export class AnthropicProtocol implements InferenceProtocol {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: options.signal,
+      signal: options.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -140,7 +142,7 @@ export class AnthropicProtocol implements InferenceProtocol {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: options.signal,
+      signal: options.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -150,9 +152,18 @@ export class AnthropicProtocol implements InferenceProtocol {
       );
     }
 
-    const reader = response.body!.getReader();
+    // Bug D fix: null check on response.body
+    if (!response.body) {
+      throw new Error("Anthropic streaming error: response body is null");
+    }
+
+    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let messageStopReason: string | undefined;
+
+    // Bug B fix: track tool_use blocks being built across events
+    const pendingToolCalls: Map<number, { id: string; name: string; inputJson: string }> = new Map();
 
     try {
       while (true) {
@@ -180,13 +191,63 @@ export class AnthropicProtocol implements InferenceProtocol {
             continue;
           }
 
-          if (parsed.type === "content_block_delta") {
+          // Bug C fix: capture stop_reason from message_start or message_delta
+          if (parsed.type === "message_start") {
+            // stop_reason may appear later in message_delta
+            if (parsed.message?.stop_reason) {
+              messageStopReason = parsed.message.stop_reason;
+            }
+          } else if (parsed.type === "message_delta") {
+            if (parsed.delta?.stop_reason) {
+              messageStopReason = parsed.delta.stop_reason;
+            }
+          } else if (parsed.type === "content_block_start") {
+            // Bug B fix: handle tool_use content block starts
+            const contentBlock = parsed.content_block;
+            if (contentBlock?.type === "tool_use") {
+              pendingToolCalls.set(parsed.index ?? 0, {
+                id: contentBlock.id ?? "",
+                name: contentBlock.name ?? "",
+                inputJson: "",
+              });
+            }
+          } else if (parsed.type === "content_block_delta") {
             const delta = parsed.delta;
             if (delta?.type === "text_delta") {
               yield { delta: delta.text ?? "" };
+            } else if (delta?.type === "input_json_delta") {
+              // Bug B fix: accumulate tool input JSON fragments
+              const pending = pendingToolCalls.get(parsed.index ?? 0);
+              if (pending) {
+                pending.inputJson += delta.partial_json ?? "";
+              }
+            }
+          } else if (parsed.type === "content_block_stop") {
+            // Bug B fix: emit completed tool call when content block ends
+            const pending = pendingToolCalls.get(parsed.index ?? 0);
+            if (pending) {
+              let parsedInput: unknown;
+              try {
+                parsedInput = JSON.parse(pending.inputJson || "{}");
+              } catch {
+                parsedInput = {};
+              }
+              yield {
+                delta: "",
+                toolCalls: [{
+                  id: pending.id,
+                  type: "function" as const,
+                  function: {
+                    name: pending.name,
+                    arguments: JSON.stringify(parsedInput),
+                  },
+                }],
+              };
+              pendingToolCalls.delete(parsed.index ?? 0);
             }
           } else if (parsed.type === "message_stop") {
-            yield { delta: "", finishReason: "end_turn" };
+            // Bug C fix: use actual stop_reason instead of hardcoded "end_turn"
+            yield { delta: "", finishReason: messageStopReason ?? "end_turn" };
           }
         }
       }
@@ -217,27 +278,57 @@ export class AnthropicProtocol implements InferenceProtocol {
       }
     }
 
-    // 2. Convert tool messages to user messages, merge consecutive same-role
+    // 2. Convert to Anthropic format with proper content blocks
     const processed: Record<string, unknown>[] = [];
 
     for (const msg of nonSystem) {
+      // Bug A fix: tool messages become user messages with tool_result content blocks
       if (msg.role === "tool") {
-        // Tool results become user messages with tool_result content blocks
-        const toolContent = `[tool_result:${msg.tool_call_id ?? "unknown"}] ${msg.content}`;
+        const toolResultBlock = {
+          type: "tool_result",
+          tool_use_id: msg.tool_call_id ?? "unknown",
+          content: msg.content,
+        };
+
+        // If the previous message is already a user message with content array, merge
         const last = processed[processed.length - 1];
-        if (last && last.role === "user") {
-          // Merge into existing user message
-          last.content = (last.content as string) + "\n" + toolContent;
+        if (last && last.role === "user" && Array.isArray(last.content)) {
+          (last.content as unknown[]).push(toolResultBlock);
           continue;
         }
-        processed.push({ role: "user", content: toolContent });
+
+        processed.push({ role: "user", content: [toolResultBlock] });
         continue;
       }
 
-      // Merge consecutive same-role messages
+      // Bug A fix: assistant messages with tool_calls preserve tool_use blocks
+      if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+        const contentBlocks: unknown[] = [];
+        if (msg.content) {
+          contentBlocks.push({ type: "text", text: msg.content });
+        }
+        for (const tc of msg.tool_calls) {
+          let input: unknown;
+          try {
+            input = JSON.parse(tc.function.arguments);
+          } catch {
+            input = {};
+          }
+          contentBlocks.push({
+            type: "tool_use",
+            id: tc.id,
+            name: tc.function.name,
+            input,
+          });
+        }
+        processed.push({ role: "assistant", content: contentBlocks });
+        continue;
+      }
+
+      // Merge consecutive same-role messages (only for plain text messages)
       const last = processed[processed.length - 1];
-      if (last && last.role === msg.role) {
-        last.content = ((last.content as string) ?? "") + "\n" + (msg.content ?? "");
+      if (last && last.role === msg.role && typeof last.content === "string") {
+        last.content = (last.content as string) + "\n" + (msg.content ?? "");
         continue;
       }
 
@@ -280,13 +371,22 @@ interface AnthropicResponse {
 
 interface AnthropicStreamEvent {
   type: string;
+  index?: number;
   delta?: {
     type?: string;
     text?: string;
+    partial_json?: string;
+    stop_reason?: string;
+  };
+  content_block?: {
+    type?: string;
+    id?: string;
+    name?: string;
   };
   message?: {
     id: string;
     model: string;
+    stop_reason?: string;
     usage?: { input_tokens: number };
   };
 }
