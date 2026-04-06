@@ -3,6 +3,9 @@
  *
  * DB-backed registry of available models with capabilities and pricing.
  * Seeded from a static baseline, updatable at runtime from Conway API.
+ *
+ * Also exports ExpandedModelRegistry — an in-memory 3-layer registry for
+ * the multi-LLM provider system (builtin catalog + discovered + custom).
  */
 
 import type BetterSqlite3 from "better-sqlite3";
@@ -185,5 +188,144 @@ export class ModelRegistry {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+}
+
+// ─── Expanded Model Registry (Multi-LLM) ────────────────────────────────────
+
+import type { Protocol, DiscoveredModel } from "./protocols/types.js";
+import type { BuiltinModelEntry, ModelTier, ModelSource } from "./catalog/builtin-models.js";
+import type { PricingEntry } from "./catalog/pricing-updater.js";
+
+export interface ExpandedModelEntry {
+  modelId: string;
+  provider: string;
+  protocol: Protocol;
+  baseUrl: string;
+  displayName: string;
+  tier: ModelTier;
+  costPer1kInput: number;
+  costPer1kOutput: number;
+  contextWindow: number;
+  maxOutputTokens: number;
+  supportsTools: boolean;
+  supportsVision: boolean;
+  supportsStreaming: boolean;
+  source: ModelSource;
+  enabled: boolean;
+}
+
+export class ExpandedModelRegistry {
+  private models: Map<string, ExpandedModelEntry> = new Map();
+
+  constructor(builtins?: BuiltinModelEntry[]) {
+    if (builtins) {
+      for (const model of builtins) {
+        this.models.set(model.modelId, { ...model });
+      }
+    }
+  }
+
+  get(modelId: string): ExpandedModelEntry | undefined {
+    return this.models.get(modelId);
+  }
+
+  getAll(): ExpandedModelEntry[] {
+    return Array.from(this.models.values());
+  }
+
+  getEnabled(): ExpandedModelEntry[] {
+    return this.getAll().filter((m) => m.enabled);
+  }
+
+  getByProtocol(protocol: Protocol): ExpandedModelEntry[] {
+    return this.getAll().filter((m) => m.protocol === protocol);
+  }
+
+  getByTier(tier: ModelTier): ExpandedModelEntry[] {
+    return this.getAll().filter((m) => m.tier === tier);
+  }
+
+  setEnabled(modelId: string, enabled: boolean): void {
+    const model = this.models.get(modelId);
+    if (model) {
+      model.enabled = enabled;
+    }
+  }
+
+  /**
+   * Layer 2: Merge discovered models from a provider's listModels() response.
+   * If the model already exists in the registry (builtin), keep its metadata.
+   * If unknown, add with protocol defaults and source: "discovered".
+   */
+  mergeDiscovered(
+    discovered: DiscoveredModel[],
+    protocol: Protocol,
+    baseUrl: string,
+  ): void {
+    for (const d of discovered) {
+      if (this.models.has(d.modelId)) {
+        // Already in registry (builtin or previously discovered) — skip
+        continue;
+      }
+
+      this.models.set(d.modelId, {
+        modelId: d.modelId,
+        provider: d.ownedBy ?? "unknown",
+        protocol,
+        baseUrl,
+        displayName: d.displayName ?? d.modelId,
+        tier: "balanced", // default tier for discovered models
+        costPer1kInput: 0,
+        costPer1kOutput: 0,
+        contextWindow: 128000, // conservative default
+        maxOutputTokens: 8192,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+        source: "discovered",
+        enabled: true,
+      });
+    }
+  }
+
+  /**
+   * Layer 3: Add custom user-defined models.
+   * Overwrites any existing entry with the same modelId.
+   */
+  addCustomModels(models: ExpandedModelEntry[]): void {
+    for (const model of models) {
+      this.models.set(model.modelId, { ...model, source: "custom" });
+    }
+  }
+
+  /**
+   * Update pricing for a model.
+   * Skips models with source: "custom" to respect user customizations.
+   */
+  updatePricing(modelId: string, pricing: PricingEntry): void {
+    const model = this.models.get(modelId);
+    if (!model) return;
+    if (model.source === "custom") return;
+
+    model.costPer1kInput = pricing.costPer1kInput;
+    model.costPer1kOutput = pricing.costPer1kOutput;
+  }
+
+  /**
+   * Get all models as pricing target objects for the PricingUpdater.
+   */
+  getPricingTargets(): Array<{
+    modelId: string;
+    source: string;
+    costPer1kInput: number;
+    costPer1kOutput: number;
+  }> {
+    return this.getAll().map((m) => ({
+      modelId: m.modelId,
+      source: m.source,
+      costPer1kInput: m.costPer1kInput,
+      costPer1kOutput: m.costPer1kOutput,
+    }));
   }
 }
