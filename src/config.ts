@@ -16,6 +16,64 @@ import { PROVIDER_DEFAULT_URLS, PROVIDER_ENV_VARS } from "./inference/catalog/bu
 import type { Protocol } from "./inference/protocols/types.js";
 import type { ModelTier } from "./inference/catalog/builtin-models.js";
 
+// ─── SSRF Protection ────────────────────────────────────────────────────────
+
+/**
+ * Validate that a base URL does not point to internal/metadata IP addresses.
+ * Allows localhost (127.0.0.1) only for Ollama.
+ * Blocks: 169.254.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.x.x.x (non-Ollama).
+ */
+export function validateBaseUrl(
+  url: string,
+  providerName: string,
+): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+
+  const hostname = parsed.hostname;
+
+  // Resolve hostname to check against blocked ranges
+  // For IP-literal hostnames, check directly
+  const ipv4Match = hostname.match(
+    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/,
+  );
+
+  if (ipv4Match) {
+    const [, a, b] = ipv4Match.map(Number);
+
+    // AWS/cloud metadata endpoint
+    if (a === 169 && b === 254) return false;
+
+    // Private class A
+    if (a === 10) return false;
+
+    // Private class B
+    if (a === 172 && b >= 16 && b <= 31) return false;
+
+    // Private class C
+    if (a === 192 && b === 168) return false;
+
+    // Loopback — allow only for Ollama
+    if (a === 127) {
+      return providerName === "ollama";
+    }
+  }
+
+  // Block "localhost" hostname for non-Ollama providers
+  if (
+    (hostname === "localhost" || hostname === "::1") &&
+    providerName !== "ollama"
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 // ─── Provider Config Types ───────────────────────────────────────────────────
 
 export interface ResolvedProviderConfig {
@@ -119,6 +177,14 @@ export function resolveProviderConfigs(config: Record<string, unknown>): Resolve
       }
     }
 
+    // Bug H fix: validate baseUrl against SSRF targets
+    if (baseUrl && !validateBaseUrl(baseUrl, providerName)) {
+      logger.warn(
+        `Blocked provider "${providerName}" baseUrl "${baseUrl}" — points to a private/metadata IP`,
+      );
+      continue;
+    }
+
     // Only add to result if we have at least an API key or it's Ollama (no key needed)
     if (apiKey || providerName === "ollama") {
       (result as Record<string, unknown>)[providerName] = { apiKey, baseUrl };
@@ -138,7 +204,17 @@ export function resolveProviderConfigs(config: Record<string, unknown>): Resolve
         baseUrl: (entry.baseUrl as string) ?? "",
         apiKey: (entry.apiKey as string) ?? "",
         tier: (entry.tier as ModelTier) ?? "balanced",
-      }));
+      }))
+      // Bug H fix: filter out custom providers with SSRF-unsafe baseUrls
+      .filter((entry) => {
+        if (entry.baseUrl && !validateBaseUrl(entry.baseUrl, entry.name)) {
+          logger.warn(
+            `Blocked custom provider "${entry.name}" baseUrl "${entry.baseUrl}" — points to a private/metadata IP`,
+          );
+          return false;
+        }
+        return true;
+      });
   }
 
   return result;

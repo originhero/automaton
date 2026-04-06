@@ -99,6 +99,18 @@ export class PricingUpdater {
       const pricing = data.models[model.modelId];
       if (!pricing) continue;
 
+      // Bug G fix: validate that pricing values are numeric, finite, and non-negative
+      if (
+        typeof pricing.costPer1kInput !== "number" ||
+        typeof pricing.costPer1kOutput !== "number" ||
+        !Number.isFinite(pricing.costPer1kInput) ||
+        !Number.isFinite(pricing.costPer1kOutput) ||
+        pricing.costPer1kInput < 0 ||
+        pricing.costPer1kOutput < 0
+      ) {
+        continue;
+      }
+
       if (
         pricing.costPer1kInput !== model.costPer1kInput ||
         pricing.costPer1kOutput !== model.costPer1kOutput
