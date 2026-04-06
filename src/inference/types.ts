@@ -26,6 +26,12 @@ import type {
   ModelStrategyConfig,
 } from "../types.js";
 
+// === Protocol & Catalog Type Re-exports ===
+
+export type { Protocol } from "./protocols/types.js";
+export type { ModelTier, ModelSource, BuiltinModelEntry } from "./catalog/builtin-models.js";
+export { BUILTIN_MODELS, PROVIDER_DEFAULT_URLS, PROVIDER_ENV_VARS } from "./catalog/builtin-models.js";
+
 // === Default Retry Policy ===
 
 export const DEFAULT_RETRY_POLICY = {
@@ -132,6 +138,35 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
     parameterStyle: "max_completion_tokens",
     enabled: true,
   },
+  // ─── Google Gemini ──────────────────────────────────────────────
+  {
+    modelId: "gemini-2.5-pro",
+    provider: "google",
+    displayName: "Gemini 2.5 Pro",
+    tierMinimum: "normal",
+    costPer1kInput: 13,    // $1.25/M
+    costPer1kOutput: 100,  // $10.00/M
+    maxTokens: 65536,
+    contextWindow: 1048576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gemini-2.5-flash",
+    provider: "google",
+    displayName: "Gemini 2.5 Flash",
+    tierMinimum: "low_compute",
+    costPer1kInput: 2,     // $0.15/M
+    costPer1kOutput: 6,    // $0.60/M
+    maxTokens: 65536,
+    contextWindow: 1048576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
 ];
 
 // === Default Routing Matrix ===
@@ -139,30 +174,30 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
 
 export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
   high: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 4096, ceilingCents: 20 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 15 },
-    planning: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
+    agent_turn: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5.3", "gemini-2.5-pro"], maxTokens: 8192, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gemini-2.5-flash", "gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5.3", "gemini-2.5-pro"], maxTokens: 4096, ceilingCents: 20 },
+    summarization: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 15 },
+    planning: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5.3", "gemini-2.5-pro"], maxTokens: 8192, ceilingCents: -1 },
   },
   normal: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    planning: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
+    agent_turn: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5-mini", "gemini-2.5-pro"], maxTokens: 4096, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gemini-2.5-flash", "gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5-mini", "gemini-2.5-pro"], maxTokens: 4096, ceilingCents: 10 },
+    summarization: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
+    planning: { candidates: ["gemini-2.5-flash", "gpt-5.2", "gpt-5-mini", "gemini-2.5-pro"], maxTokens: 4096, ceilingCents: -1 },
   },
   low_compute: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    summarization: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    planning: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    agent_turn: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 4096, ceilingCents: 10 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 1024, ceilingCents: 2 },
+    safety_check: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 2048, ceilingCents: 5 },
+    summarization: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 2048, ceilingCents: 5 },
   },
   critical: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 3 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 512, ceilingCents: 1 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
+    agent_turn: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 2048, ceilingCents: 3 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 512, ceilingCents: 1 },
+    safety_check: { candidates: ["gpt-5-mini", "gemini-2.5-flash"], maxTokens: 1024, ceilingCents: 2 },
     summarization: { candidates: [], maxTokens: 0, ceilingCents: 0 },
     planning: { candidates: [], maxTokens: 0, ceilingCents: 0 },
   },
