@@ -19,8 +19,19 @@ import type {
   ModelPreference,
 } from "../types.js";
 import { ModelRegistry } from "./registry.js";
+import { ExpandedModelRegistry, type ExpandedModelEntry } from "./registry.js";
 import { InferenceBudgetTracker } from "./budget.js";
 import { DEFAULT_ROUTING_MATRIX, TASK_TIMEOUTS } from "./types.js";
+import { OpenAICompatibleProtocol } from "./protocols/openai-compatible.js";
+import { AnthropicProtocol } from "./protocols/anthropic.js";
+import { GoogleProtocol } from "./protocols/google.js";
+import { OllamaProtocol } from "./protocols/ollama.js";
+import type {
+  InferenceProtocol,
+  ChatOptions as ProtocolChatOptions,
+  ChatResult,
+  Message as ProtocolMessage,
+} from "./protocols/types.js";
 
 type Database = BetterSqlite3.Database;
 
@@ -326,5 +337,153 @@ export class InferenceRouter {
 
   private getPreference(tier: SurvivalTier, taskType: InferenceTaskType): ModelPreference | undefined {
     return DEFAULT_ROUTING_MATRIX[tier]?.[taskType];
+  }
+
+  /**
+   * Create the appropriate protocol adapter for a model entry.
+   */
+  private createProtocolAdapter(model: ExpandedModelEntry, apiKey: string): InferenceProtocol {
+    switch (model.protocol) {
+      case "openai-compatible":
+        return new OpenAICompatibleProtocol({
+          baseUrl: model.baseUrl,
+          apiKey,
+        });
+      case "anthropic":
+        return new AnthropicProtocol({
+          baseUrl: model.baseUrl,
+          apiKey,
+        });
+      case "google":
+        return new GoogleProtocol({
+          baseUrl: model.baseUrl,
+          apiKey,
+        });
+      case "ollama":
+        return new OllamaProtocol({
+          baseUrl: model.baseUrl,
+        });
+      default: {
+        const exhaustive: never = model.protocol;
+        throw new Error(`Unknown protocol: ${exhaustive}`);
+      }
+    }
+  }
+
+  /**
+   * Route an inference request using the protocol-based system.
+   * This is the new entry point that replaces the old `route()` method
+   * once the migration is complete.
+   */
+  async routeWithProtocol(
+    request: InferenceRequest,
+    expandedRegistry: ExpandedModelRegistry,
+    resolveApiKey: (provider: string) => string,
+  ): Promise<InferenceResult> {
+    const { messages, taskType, tier, sessionId, turnId, tools } = request;
+
+    // 1. Select model from routing matrix (reuse existing logic)
+    const legacyModel = this.selectModel(tier, taskType);
+    if (!legacyModel) {
+      return {
+        content: "",
+        model: "none",
+        provider: "other",
+        inputTokens: 0,
+        outputTokens: 0,
+        costCents: 0,
+        latencyMs: 0,
+        finishReason: "error",
+        toolCalls: undefined,
+      };
+    }
+
+    // 2. Look up expanded model entry for protocol info
+    const expandedModel = expandedRegistry.get(legacyModel.modelId);
+    if (!expandedModel) {
+      // Fall back to legacy routing
+      return this.route(request, async () => {
+        throw new Error(`No protocol adapter found for model: ${legacyModel.modelId}`);
+      });
+    }
+
+    // 3. Get API key for this provider
+    const apiKey = resolveApiKey(expandedModel.provider);
+
+    // 4. Create protocol adapter
+    const protocol = this.createProtocolAdapter(expandedModel, apiKey);
+
+    // 5. Build protocol options
+    const preference = this.getPreference(tier, taskType);
+    const maxTokens = request.maxTokens || preference?.maxTokens || expandedModel.maxOutputTokens;
+
+    const protocolOptions: ProtocolChatOptions = {
+      model: expandedModel.modelId,
+      maxTokens,
+      tools: tools as ProtocolChatOptions["tools"],
+    };
+
+    // 6. Convert ChatMessage[] to protocol Message[]
+    const protocolMessages: ProtocolMessage[] = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      name: m.name,
+      tool_calls: m.tool_calls,
+      tool_call_id: m.tool_call_id,
+    }));
+
+    // 7. Call protocol adapter
+    const startTime = Date.now();
+    let result: ChatResult;
+    try {
+      result = await protocol.chat(protocolMessages, protocolOptions);
+    } catch (error: unknown) {
+      const latencyMs = Date.now() - startTime;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: `Protocol error: ${message}`,
+        model: expandedModel.modelId,
+        provider: expandedModel.provider as ModelProvider,
+        inputTokens: 0,
+        outputTokens: 0,
+        costCents: 0,
+        latencyMs,
+        finishReason: "error",
+      };
+    }
+    const latencyMs = Date.now() - startTime;
+
+    // 8. Calculate cost
+    const actualCostCents = Math.ceil(
+      (result.inputTokens / 1000) * expandedModel.costPer1kInput / 100 +
+      (result.outputTokens / 1000) * expandedModel.costPer1kOutput / 100,
+    );
+
+    // 9. Record cost
+    this.budget.recordCost({
+      sessionId,
+      turnId: turnId || null,
+      model: expandedModel.modelId,
+      provider: expandedModel.provider,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      costCents: actualCostCents,
+      latencyMs,
+      tier,
+      taskType,
+      cacheHit: false,
+    });
+
+    return {
+      content: result.content,
+      model: result.model,
+      provider: expandedModel.provider as ModelProvider,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      costCents: actualCostCents,
+      latencyMs,
+      toolCalls: result.toolCalls,
+      finishReason: result.finishReason,
+    };
   }
 }
