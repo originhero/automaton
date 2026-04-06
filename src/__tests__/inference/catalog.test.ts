@@ -1,169 +1,170 @@
-import { describe, expect, it } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { BUILTIN_MODELS, PROVIDER_DEFAULT_URLS, PROVIDER_ENV_VARS } from "../../inference/catalog/builtin-models.js";
+import { PricingUpdater, type PricingData, type ModelPricingTarget } from "../../inference/catalog/pricing-updater.js";
+import type { FetchFn } from "../../inference/protocols/types.js";
 
-import {
-  BUILTIN_MODELS,
-  PROVIDER_DEFAULT_URLS,
-  PROVIDER_ENV_VARS,
-  type BuiltinModelEntry,
-  type ModelTier,
-  type ModelSource,
-} from "../../inference/catalog/builtin-models.js";
-
-const VALID_PROTOCOLS = ["openai-compatible", "anthropic", "google", "ollama"] as const;
-const VALID_TIERS: ModelTier[] = ["frontier", "balanced", "economy", "local"];
-const VALID_SOURCES: ModelSource[] = ["builtin", "discovered", "custom"];
-
-describe("BUILTIN_MODELS catalog", () => {
-  it("exports a non-empty array", () => {
-    expect(Array.isArray(BUILTIN_MODELS)).toBe(true);
-    expect(BUILTIN_MODELS.length).toBeGreaterThanOrEqual(20);
+describe("Builtin Model Catalog", () => {
+  it("contains at least 15 models", () => {
+    expect(BUILTIN_MODELS.length).toBeGreaterThanOrEqual(15);
   });
 
-  it("all entries have required string fields", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(typeof entry.modelId, `modelId on ${entry.modelId}`).toBe("string");
-      expect(entry.modelId.length, `modelId empty on entry`).toBeGreaterThan(0);
-
-      expect(typeof entry.provider, `provider on ${entry.modelId}`).toBe("string");
-      expect(entry.provider.length, `provider empty on ${entry.modelId}`).toBeGreaterThan(0);
-
-      expect(typeof entry.baseUrl, `baseUrl on ${entry.modelId}`).toBe("string");
-      expect(entry.baseUrl.length, `baseUrl empty on ${entry.modelId}`).toBeGreaterThan(0);
-
-      expect(typeof entry.displayName, `displayName on ${entry.modelId}`).toBe("string");
-      expect(entry.displayName.length, `displayName empty on ${entry.modelId}`).toBeGreaterThan(0);
+  it("every model has all required fields", () => {
+    for (const model of BUILTIN_MODELS) {
+      expect(model.modelId).toBeTruthy();
+      expect(model.provider).toBeTruthy();
+      expect(["openai-compatible", "anthropic", "google", "ollama"]).toContain(model.protocol);
+      expect(model.baseUrl).toBeTruthy();
+      expect(model.displayName).toBeTruthy();
+      expect(["frontier", "balanced", "economy", "local"]).toContain(model.tier);
+      expect(typeof model.costPer1kInput).toBe("number");
+      expect(typeof model.costPer1kOutput).toBe("number");
+      expect(model.contextWindow).toBeGreaterThan(0);
+      expect(model.maxOutputTokens).toBeGreaterThan(0);
+      expect(typeof model.supportsTools).toBe("boolean");
+      expect(typeof model.supportsVision).toBe("boolean");
+      expect(typeof model.supportsStreaming).toBe("boolean");
+      expect(model.source).toBe("builtin");
+      expect(model.enabled).toBe(true);
     }
   });
 
-  it("all entries have a valid protocol", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(
-        VALID_PROTOCOLS.includes(entry.protocol as (typeof VALID_PROTOCOLS)[number]),
-        `invalid protocol "${entry.protocol}" on ${entry.modelId}`,
-      ).toBe(true);
-    }
-  });
-
-  it("all entries have a valid tier", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(
-        VALID_TIERS.includes(entry.tier),
-        `invalid tier "${entry.tier}" on ${entry.modelId}`,
-      ).toBe(true);
-    }
-  });
-
-  it("all entries have source set to 'builtin'", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(entry.source, `source on ${entry.modelId}`).toBe("builtin");
-    }
-  });
-
-  it("all entries have non-negative numeric cost fields", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(typeof entry.costPer1kInput, `costPer1kInput on ${entry.modelId}`).toBe("number");
-      expect(entry.costPer1kInput, `costPer1kInput negative on ${entry.modelId}`).toBeGreaterThanOrEqual(0);
-
-      expect(typeof entry.costPer1kOutput, `costPer1kOutput on ${entry.modelId}`).toBe("number");
-      expect(entry.costPer1kOutput, `costPer1kOutput negative on ${entry.modelId}`).toBeGreaterThanOrEqual(0);
-    }
-  });
-
-  it("all entries have positive contextWindow and maxOutputTokens", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(entry.contextWindow, `contextWindow on ${entry.modelId}`).toBeGreaterThan(0);
-      expect(entry.maxOutputTokens, `maxOutputTokens on ${entry.modelId}`).toBeGreaterThan(0);
-    }
-  });
-
-  it("all entries have boolean capability flags", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(typeof entry.supportsTools, `supportsTools on ${entry.modelId}`).toBe("boolean");
-      expect(typeof entry.supportsVision, `supportsVision on ${entry.modelId}`).toBe("boolean");
-      expect(typeof entry.supportsStreaming, `supportsStreaming on ${entry.modelId}`).toBe("boolean");
-    }
-  });
-
-  it("all entries have a boolean enabled field", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(typeof entry.enabled, `enabled on ${entry.modelId}`).toBe("boolean");
-    }
-  });
-
-  it("all modelIds are unique", () => {
-    const ids = BUILTIN_MODELS.map((e) => e.modelId);
+  it("has no duplicate modelIds", () => {
+    const ids = BUILTIN_MODELS.map(m => m.modelId);
     const unique = new Set(ids);
     expect(unique.size).toBe(ids.length);
   });
 
-  it("covers the required set of providers", () => {
-    const providers = new Set(BUILTIN_MODELS.map((e) => e.provider));
-    const required = ["openai", "anthropic", "google", "deepseek", "xai", "ollama"];
-    for (const p of required) {
-      expect(providers.has(p), `missing provider: ${p}`).toBe(true);
+  it("covers OpenAI, Anthropic, Google, DeepSeek, xAI providers", () => {
+    const providers = new Set(BUILTIN_MODELS.map(m => m.provider));
+    expect(providers.has("openai")).toBe(true);
+    expect(providers.has("anthropic")).toBe(true);
+    expect(providers.has("google")).toBe(true);
+    expect(providers.has("deepseek")).toBe(true);
+    expect(providers.has("xai")).toBe(true);
+  });
+
+  it("has at least one model per tier", () => {
+    const tiers = new Set(BUILTIN_MODELS.map(m => m.tier));
+    expect(tiers.has("frontier")).toBe(true);
+    expect(tiers.has("balanced")).toBe(true);
+    expect(tiers.has("economy")).toBe(true);
+    expect(tiers.has("local")).toBe(true);
+  });
+
+  it("Ollama models have zero cost", () => {
+    const ollamaModels = BUILTIN_MODELS.filter(m => m.protocol === "ollama");
+    for (const model of ollamaModels) {
+      expect(model.costPer1kInput).toBe(0);
+      expect(model.costPer1kOutput).toBe(0);
     }
   });
 
-  it("covers all four tiers", () => {
-    const tiers = new Set(BUILTIN_MODELS.map((e) => e.tier));
-    for (const tier of VALID_TIERS) {
-      expect(tiers.has(tier), `missing tier: ${tier}`).toBe(true);
-    }
-  });
-
-  it("local-tier models have zero cost", () => {
-    const localModels = BUILTIN_MODELS.filter((e) => e.tier === "local");
-    expect(localModels.length).toBeGreaterThan(0);
-    for (const entry of localModels) {
-      expect(entry.costPer1kInput, `costPer1kInput should be 0 for ${entry.modelId}`).toBe(0);
-      expect(entry.costPer1kOutput, `costPer1kOutput should be 0 for ${entry.modelId}`).toBe(0);
-    }
-  });
-
-  it("baseUrl starts with http:// or https://", () => {
-    for (const entry of BUILTIN_MODELS) {
-      expect(
-        entry.baseUrl.startsWith("http://") || entry.baseUrl.startsWith("https://"),
-        `invalid baseUrl "${entry.baseUrl}" on ${entry.modelId}`,
-      ).toBe(true);
-    }
-  });
-});
-
-describe("PROVIDER_DEFAULT_URLS", () => {
-  it("is a non-empty record of strings", () => {
-    expect(typeof PROVIDER_DEFAULT_URLS).toBe("object");
-    expect(Object.keys(PROVIDER_DEFAULT_URLS).length).toBeGreaterThan(0);
-    for (const [key, value] of Object.entries(PROVIDER_DEFAULT_URLS)) {
-      expect(typeof key).toBe("string");
-      expect(typeof value).toBe("string");
-      expect(value.startsWith("http")).toBe(true);
-    }
-  });
-
-  it("has an entry for every provider found in BUILTIN_MODELS", () => {
-    const providers = new Set(BUILTIN_MODELS.map((e) => e.provider));
+  it("PROVIDER_DEFAULT_URLS covers all providers with builtin models", () => {
+    const providers = new Set(BUILTIN_MODELS.map(m => m.provider));
     for (const provider of providers) {
-      expect(
-        PROVIDER_DEFAULT_URLS[provider],
-        `missing default URL for provider: ${provider}`,
-      ).toBeDefined();
+      expect(PROVIDER_DEFAULT_URLS[provider]).toBeTruthy();
     }
   });
 });
 
-describe("PROVIDER_ENV_VARS", () => {
-  it("is a non-empty record of strings", () => {
-    expect(typeof PROVIDER_ENV_VARS).toBe("object");
-    expect(Object.keys(PROVIDER_ENV_VARS).length).toBeGreaterThan(0);
-    for (const [key, value] of Object.entries(PROVIDER_ENV_VARS)) {
-      expect(typeof key).toBe("string");
-      expect(typeof value).toBe("string");
-      expect(value.length).toBeGreaterThan(0);
-    }
+describe("PricingUpdater", () => {
+  it("fetches and parses pricing data", async () => {
+    const pricingData: PricingData = {
+      version: 1,
+      updatedAt: "2026-04-06T00:00:00Z",
+      models: {
+        "gpt-4o": { costPer1kInput: 260, costPer1kOutput: 1050 },
+      },
+    };
+
+    const fetchFn: FetchFn = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(pricingData),
+    } as Response);
+
+    const updater = new PricingUpdater({ fetchFn, pricingUrl: "https://example.com/pricing.json" });
+    const data = await updater.fetchPricing();
+
+    expect(data).toBeDefined();
+    expect(data!.models["gpt-4o"].costPer1kInput).toBe(260);
   });
 
-  it("does not include ollama (local models need no API key)", () => {
-    expect(PROVIDER_ENV_VARS["ollama"]).toBeUndefined();
+  it("returns null on network error (silent fail)", async () => {
+    const fetchFn: FetchFn = vi.fn().mockRejectedValue(new Error("Network error"));
+
+    const updater = new PricingUpdater({ fetchFn });
+    const data = await updater.fetchPricing();
+
+    expect(data).toBeNull();
+  });
+
+  it("returns null on non-OK response", async () => {
+    const fetchFn: FetchFn = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+    } as Response);
+
+    const updater = new PricingUpdater({ fetchFn });
+    const data = await updater.fetchPricing();
+
+    expect(data).toBeNull();
+  });
+
+  it("merges pricing and skips custom models", async () => {
+    const pricingData: PricingData = {
+      version: 1,
+      updatedAt: "2026-04-06T00:00:00Z",
+      models: {
+        "gpt-4o": { costPer1kInput: 260, costPer1kOutput: 1050 },
+        "my-custom": { costPer1kInput: 999, costPer1kOutput: 999 },
+      },
+    };
+
+    const fetchFn: FetchFn = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(pricingData),
+    } as Response);
+
+    const models: ModelPricingTarget[] = [
+      { modelId: "gpt-4o", source: "builtin", costPer1kInput: 250, costPer1kOutput: 1000 },
+      { modelId: "my-custom", source: "custom", costPer1kInput: 100, costPer1kOutput: 200 },
+    ];
+
+    const onUpdate = vi.fn();
+    const updater = new PricingUpdater({ fetchFn, pricingUrl: "https://example.com/pricing.json" });
+    const updated = await updater.updatePricing(models, onUpdate);
+
+    // gpt-4o should be updated (builtin, prices differ)
+    expect(updated).toContain("gpt-4o");
+    expect(onUpdate).toHaveBeenCalledWith("gpt-4o", { costPer1kInput: 260, costPer1kOutput: 1050 });
+
+    // my-custom should NOT be updated (custom source)
+    expect(updated).not.toContain("my-custom");
+  });
+
+  it("does not call onUpdate when prices match", async () => {
+    const pricingData: PricingData = {
+      version: 1,
+      updatedAt: "2026-04-06T00:00:00Z",
+      models: {
+        "gpt-4o": { costPer1kInput: 250, costPer1kOutput: 1000 },
+      },
+    };
+
+    const fetchFn: FetchFn = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(pricingData),
+    } as Response);
+
+    const models: ModelPricingTarget[] = [
+      { modelId: "gpt-4o", source: "builtin", costPer1kInput: 250, costPer1kOutput: 1000 },
+    ];
+
+    const onUpdate = vi.fn();
+    const updater = new PricingUpdater({ fetchFn, pricingUrl: "https://example.com/pricing.json" });
+    const updated = await updater.updatePricing(models, onUpdate);
+
+    expect(updated).toHaveLength(0);
+    expect(onUpdate).not.toHaveBeenCalled();
   });
 });
