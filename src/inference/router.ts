@@ -32,6 +32,8 @@ import type {
   ChatResult,
   Message as ProtocolMessage,
 } from "./protocols/types.js";
+import { InferenceRateLimiter } from "./rate-limiter.js";
+import type { RateLimiterConfig } from "./rate-limiter.js";
 
 type Database = BetterSqlite3.Database;
 
@@ -39,11 +41,18 @@ export class InferenceRouter {
   private db: Database;
   private registry: ModelRegistry;
   private budget: InferenceBudgetTracker;
+  private rateLimiter: InferenceRateLimiter;
 
-  constructor(db: Database, registry: ModelRegistry, budget: InferenceBudgetTracker) {
+  constructor(
+    db: Database,
+    registry: ModelRegistry,
+    budget: InferenceBudgetTracker,
+    rateLimiterConfig?: Partial<RateLimiterConfig>,
+  ) {
     this.db = db;
     this.registry = registry;
     this.budget = budget;
+    this.rateLimiter = new InferenceRateLimiter(rateLimiterConfig);
   }
 
   /**
@@ -124,7 +133,10 @@ export class InferenceRouter {
       tools: tools,
     };
 
-    // 6. Call inference with timeout
+    // 6. Rate limit: wait for an available token before calling inference
+    await this.rateLimiter.waitForToken(model.provider);
+
+    // 7. Call inference with timeout
     const startTime = Date.now();
     let response: any;
     try {
@@ -138,6 +150,10 @@ export class InferenceRouter {
       }
     } catch (error: any) {
       const latencyMs = Date.now() - startTime;
+      // Record failure with rate limiter
+      const retryAfterMs = this.extractRetryAfterMs(error);
+      this.rateLimiter.recordFailure(model.provider, retryAfterMs);
+
       // If fallback is enabled, try next candidate
       if (error.name === "AbortError") {
         return {
@@ -155,7 +171,10 @@ export class InferenceRouter {
     }
     const latencyMs = Date.now() - startTime;
 
-    // 7. Calculate actual cost
+    // Record success with rate limiter
+    this.rateLimiter.recordSuccess(model.provider);
+
+    // 8. Calculate actual cost
     const inputTokens = response.usage?.promptTokens || 0;
     const outputTokens = response.usage?.completionTokens || 0;
     const actualCostCents = Math.ceil(
@@ -163,7 +182,7 @@ export class InferenceRouter {
       (outputTokens / 1000) * model.costPer1kOutput / 100,
     );
 
-    // 8. Record cost
+    // 9. Record cost
     this.budget.recordCost({
       sessionId,
       turnId: turnId || null,
@@ -178,7 +197,7 @@ export class InferenceRouter {
       cacheHit: false,
     });
 
-    // 9. Build result
+    // 10. Build result
     return {
       content: response.message?.content || "",
       model: model.modelId,
@@ -340,6 +359,39 @@ export class InferenceRouter {
   }
 
   /**
+   * Extract a Retry-After value (in ms) from an error, if present.
+   * Handles errors with `headers` (fetch Response-like), `response.headers`,
+   * or a numeric `retryAfter` property.
+   */
+  private extractRetryAfterMs(error: unknown): number | undefined {
+    if (!error || typeof error !== "object") return undefined;
+
+    const err = error as Record<string, unknown>;
+
+    // Check for a retryAfter property (some SDKs set this directly)
+    if (typeof err.retryAfter === "number" && err.retryAfter > 0) {
+      return err.retryAfter * 1000;
+    }
+
+    // Check for headers (fetch-style error or response object)
+    const headers =
+      (err.headers as Record<string, unknown>) ??
+      ((err.response as Record<string, unknown>)?.headers as Record<string, unknown>);
+
+    if (headers) {
+      const getHeader =
+        typeof (headers as any).get === "function"
+          ? (name: string) => (headers as any).get(name) as string | null
+          : (name: string) => (headers as Record<string, string>)[name] ?? null;
+
+      const retryAfterValue = getHeader("retry-after") ?? getHeader("Retry-After");
+      return InferenceRateLimiter.parseRetryAfter(retryAfterValue);
+    }
+
+    return undefined;
+  }
+
+  /**
    * Create the appropriate protocol adapter for a model entry.
    */
   private createProtocolAdapter(model: ExpandedModelEntry, apiKey: string): InferenceProtocol {
@@ -432,13 +484,20 @@ export class InferenceRouter {
       tool_call_id: m.tool_call_id,
     }));
 
-    // 7. Call protocol adapter
+    // 7. Rate limit: wait for an available token
+    await this.rateLimiter.waitForToken(expandedModel.provider);
+
+    // 8. Call protocol adapter
     const startTime = Date.now();
     let result: ChatResult;
     try {
       result = await protocol.chat(protocolMessages, protocolOptions);
     } catch (error: unknown) {
       const latencyMs = Date.now() - startTime;
+      // Record failure with rate limiter
+      const retryAfterMs = this.extractRetryAfterMs(error);
+      this.rateLimiter.recordFailure(expandedModel.provider, retryAfterMs);
+
       const message = error instanceof Error ? error.message : String(error);
       return {
         content: `Protocol error: ${message}`,
@@ -453,13 +512,16 @@ export class InferenceRouter {
     }
     const latencyMs = Date.now() - startTime;
 
-    // 8. Calculate cost
+    // Record success with rate limiter
+    this.rateLimiter.recordSuccess(expandedModel.provider);
+
+    // 9. Calculate cost
     const actualCostCents = Math.ceil(
       (result.inputTokens / 1000) * expandedModel.costPer1kInput / 100 +
       (result.outputTokens / 1000) * expandedModel.costPer1kOutput / 100,
     );
 
-    // 9. Record cost
+    // 10. Record cost
     this.budget.recordCost({
       sessionId,
       turnId: turnId || null,

@@ -132,7 +132,11 @@ export async function runAgentLoop(
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
-  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker);
+
+  // Rate limiter config from env vars: ORIGINHERO_MAX_RPM, ORIGINHERO_MAX_RPH
+  const { resolveRateLimiterConfig: resolveRlConfig } = await import("../inference/rate-limiter.js");
+  const rateLimiterConfig = resolveRlConfig();
+  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker, rateLimiterConfig);
 
   // Optional orchestration bootstrap (requires V9 goals/task tables)
   let planModeController: PlanModeController | undefined;
@@ -418,15 +422,10 @@ export async function runAgentLoop(
     source: "wakeup",
   };
 
-  // Rate limit protection: delay between turns to avoid exhausting API RPM limits.
-  // Configurable via ORIGINHERO_TURN_DELAY_MS env var (default: 3000ms = 3 seconds).
-  const turnDelayMs = Number(process.env.ORIGINHERO_TURN_DELAY_MS) || 3000;
+  // Rate limiting is now handled by InferenceRateLimiter in the inference router.
+  // The loop no longer needs its own inter-turn delay.
 
   while (running) {
-    // Throttle: wait between turns to respect API rate limits
-    if (cycleTurnCount > 0) {
-      await new Promise((resolve) => setTimeout(resolve, turnDelayMs));
-    }
 
     // Declared outside try so the catch block can access for retry/failure handling
     let claimedMessages: InboxMessageRow[] = [];
@@ -919,12 +918,11 @@ export async function runAgentLoop(
       consecutiveErrors = 0;
     } catch (err: any) {
       consecutiveErrors++;
-      log(config, `[ERROR] Turn failed: ${err.message}`);
+      log(config, `[ERROR] Turn failed: ${err.message} (attempt ${consecutiveErrors})`);
 
-      // Exponential backoff on errors to avoid hammering API
-      const errorBackoffMs = Math.min(consecutiveErrors * 5000, 30000); // 5s, 10s, 15s, 20s, 25s max 30s
-      log(config, `[ERROR] Waiting ${errorBackoffMs / 1000}s before retry (attempt ${consecutiveErrors})`);
-      await new Promise((resolve) => setTimeout(resolve, errorBackoffMs));
+      // Rate limiting and backoff for inference errors is handled by
+      // InferenceRateLimiter in the router. The loop only counts errors
+      // for the circuit breaker (MAX_CONSECUTIVE_ERRORS → forced sleep).
 
       // Handle inbox message state on turn failure:
       // Messages that have retries remaining go back to 'received';

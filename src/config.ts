@@ -15,6 +15,8 @@ import type { ChainType } from "./identity/chain.js";
 import { PROVIDER_DEFAULT_URLS, PROVIDER_ENV_VARS } from "./inference/catalog/builtin-models.js";
 import type { Protocol } from "./inference/protocols/types.js";
 import type { ModelTier } from "./inference/catalog/builtin-models.js";
+import { resolveRateLimiterConfig } from "./inference/rate-limiter.js";
+import type { RateLimiterConfig } from "./inference/rate-limiter.js";
 
 // ─── SSRF Protection ────────────────────────────────────────────────────────
 
@@ -391,6 +393,17 @@ function normalizeBusinessConfig(raw: any): BusinessConfig | undefined {
     stack: raw.stack || undefined,
   };
 }
+
+/**
+ * Resolve rate limiter configuration from environment variables.
+ * Reads ORIGINHERO_MAX_RPM and ORIGINHERO_MAX_RPH.
+ */
+export function resolveRateLimiterFromEnv(): Partial<RateLimiterConfig> {
+  return resolveRateLimiterConfig();
+}
+
+// Re-export for convenience
+export type { RateLimiterConfig };
 
 /**
  * Resolve ~ paths to absolute paths.
