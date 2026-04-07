@@ -99,7 +99,16 @@ export async function runAgentLoop(
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+
+  // Load business tools if a business config is present
+  let businessTools: AutomatonTool[] = [];
+  if (config.business) {
+    const { createBusinessTools } = await import("../local/business-connector.js");
+    businessTools = createBusinessTools();
+    logger.info(`Loaded ${businessTools.length} business tools for "${config.business.name}"`);
+  }
+
+  const tools = [...builtinTools, ...installedTools, ...businessTools];
   const toolContext: ToolContext = {
     identity,
     config,
@@ -409,7 +418,16 @@ export async function runAgentLoop(
     source: "wakeup",
   };
 
+  // Rate limit protection: delay between turns to avoid exhausting API RPM limits.
+  // Configurable via ORIGINHERO_TURN_DELAY_MS env var (default: 3000ms = 3 seconds).
+  const turnDelayMs = Number(process.env.ORIGINHERO_TURN_DELAY_MS) || 3000;
+
   while (running) {
+    // Throttle: wait between turns to respect API rate limits
+    if (cycleTurnCount > 0) {
+      await new Promise((resolve) => setTimeout(resolve, turnDelayMs));
+    }
+
     // Declared outside try so the catch block can access for retry/failure handling
     let claimedMessages: InboxMessageRow[] = [];
 
@@ -902,6 +920,11 @@ export async function runAgentLoop(
     } catch (err: any) {
       consecutiveErrors++;
       log(config, `[ERROR] Turn failed: ${err.message}`);
+
+      // Exponential backoff on errors to avoid hammering API
+      const errorBackoffMs = Math.min(consecutiveErrors * 5000, 30000); // 5s, 10s, 15s, 20s, 25s max 30s
+      log(config, `[ERROR] Waiting ${errorBackoffMs / 1000}s before retry (attempt ${consecutiveErrors})`);
+      await new Promise((resolve) => setTimeout(resolve, errorBackoffMs));
 
       // Handle inbox message state on turn failure:
       // Messages that have retries remaining go back to 'received';
