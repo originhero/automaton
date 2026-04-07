@@ -262,6 +262,16 @@ export function loadConfig(): AutomatonConfig | null {
       ...(raw.modelStrategy ?? {}),
     };
 
+    // Allow env var overrides for budget limits (configurable without editing config file)
+    const envHourlyBudget = process.env.ORIGINHERO_HOURLY_BUDGET_CENTS;
+    if (envHourlyBudget && !isNaN(Number(envHourlyBudget))) {
+      modelStrategy.hourlyBudgetCents = Number(envHourlyBudget);
+    }
+    const envSessionBudget = process.env.ORIGINHERO_SESSION_BUDGET_CENTS;
+    if (envSessionBudget && !isNaN(Number(envSessionBudget))) {
+      modelStrategy.sessionBudgetCents = Number(envSessionBudget);
+    }
+
     // Deep-merge soul config with defaults
     const soulConfig: SoulConfig = {
       ...DEFAULT_SOUL_CONFIG,

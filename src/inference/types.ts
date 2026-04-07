@@ -217,8 +217,8 @@ export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
   lowComputeModel: "gemini-2.5-flash",
   criticalModel: "gemini-2.5-flash",
   maxTokensPerTurn: 4096,
-  hourlyBudgetCents: 0,
-  sessionBudgetCents: 0,
+  hourlyBudgetCents: 10,       // $0.10/hour default — protects against runaway loops
+  sessionBudgetCents: 100,     // $1.00/session default
   perCallCeilingCents: 0,
   enableModelFallback: true,
   anthropicApiVersion: "2023-06-01",
