@@ -51,6 +51,7 @@ export interface AutomatonConfig {
   conwayApiKey: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
+  googleApiKey?: string;
   ollamaBaseUrl?: string;
   inferenceModel: string;
   maxTokensPerTurn: number;
@@ -75,11 +76,13 @@ export interface AutomatonConfig {
   rpcUrl?: string;
   /** Chain type for this automaton. Defaults to "evm" if absent. */
   chainType?: ChainType;
+  /** The digital business this automaton operates autonomously. */
+  business?: BusinessConfig;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   conwayApiUrl: "https://api.conway.tech",
-  inferenceModel: "gpt-5.2",
+  inferenceModel: "gemini-2.5-flash",
   maxTokensPerTurn: 4096,
   heartbeatConfigPath: "~/.automaton/heartbeat.yml",
   dbPath: "~/.automaton/state.db",
@@ -91,6 +94,110 @@ export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   childSandboxMemoryMb: 1024,
   socialRelayUrl: "https://social.conway.tech",
 };
+
+// ─── Business Config ────────────────────────────────────────────
+
+/** The digital business this automaton operates. */
+export interface BusinessConfig {
+  /** Human-readable name for the business (e.g. "Starlumon") */
+  name: string;
+  /** Brief description of what the business does */
+  description?: string;
+
+  /** Source code repository */
+  repo: RepoConfig;
+
+  /** Production domain(s) */
+  domains: DomainConfig[];
+
+  /** Production server(s) / infrastructure */
+  servers: ServerConfig[];
+
+  /** Connected third-party services (Supabase, Stripe, etc.) */
+  services?: ServiceConfig[];
+
+  /** Tech stack hints so the automaton knows what tools to use */
+  stack?: StackConfig;
+}
+
+export interface RepoConfig {
+  /** Full Git URL (e.g. "https://github.com/org/repo.git" or "git@github.com:org/repo.git") */
+  url: string;
+  /** Main branch (default: "main") */
+  branch?: string;
+  /** GitHub/GitLab personal access token env var name (e.g. "GITHUB_TOKEN") */
+  accessTokenEnvVar?: string;
+  /** Local clone path on the automaton's filesystem */
+  localPath?: string;
+}
+
+export interface DomainConfig {
+  /** Fully-qualified domain name (e.g. "www.starlumon.ai") */
+  fqdn: string;
+  /** DNS provider (e.g. "cloudflare", "namecheap", "hetzner") */
+  dnsProvider?: string;
+  /** Whether SSL is managed externally (Let's Encrypt, Cloudflare, etc.) */
+  sslManaged?: boolean;
+  /** Primary or alias */
+  role?: "primary" | "alias" | "staging";
+}
+
+export interface ServerConfig {
+  /** Unique identifier for this server */
+  id: string;
+  /** Display name (e.g. "Hetzner Production VPS") */
+  name: string;
+  /** Hosting provider (e.g. "hetzner", "aws", "digitalocean", "vercel") */
+  provider: string;
+  /** Server type (e.g. "vps", "managed", "serverless", "container") */
+  type: "vps" | "managed" | "serverless" | "container";
+  /** SSH host (IP or hostname) for VPS access */
+  host?: string;
+  /** SSH port (default: 22) */
+  sshPort?: number;
+  /** SSH user (default: "root") */
+  sshUser?: string;
+  /** Env var name for SSH private key path (e.g. "SSH_KEY_PATH") */
+  sshKeyEnvVar?: string;
+  /** Server region (e.g. "fsn1", "us-east-1") */
+  region?: string;
+  /** Role of this server */
+  role?: "production" | "staging" | "development";
+  /** Deploy method used (e.g. "git-pull", "docker", "rsync", "ci-cd") */
+  deployMethod?: string;
+  /** Path on server where the project is deployed */
+  deployPath?: string;
+}
+
+export interface ServiceConfig {
+  /** Service name (e.g. "supabase", "stripe", "sendgrid") */
+  name: string;
+  /** Service type category */
+  type: "database" | "auth" | "payments" | "email" | "storage" | "analytics" | "monitoring" | "cdn" | "other";
+  /** Base URL or dashboard URL */
+  url?: string;
+  /** Env var name that holds the API key/connection string */
+  apiKeyEnvVar?: string;
+  /** Additional notes for the automaton */
+  notes?: string;
+}
+
+export interface StackConfig {
+  /** Backend framework (e.g. "fastapi", "express", "django") */
+  backend?: string;
+  /** Frontend framework (e.g. "nextjs", "react", "vue") */
+  frontend?: string;
+  /** Primary language(s) */
+  languages?: string[];
+  /** Database system (e.g. "postgresql", "mongodb", "supabase") */
+  database?: string;
+  /** Container/orchestration (e.g. "docker", "kubernetes") */
+  containerization?: string;
+  /** Reverse proxy (e.g. "nginx", "caddy", "traefik") */
+  reverseProxy?: string;
+}
+
+export const DEFAULT_BUSINESS_CONFIG: BusinessConfig | undefined = undefined;
 
 // ─── Agent State ─────────────────────────────────────────────────
 
@@ -1140,7 +1247,7 @@ export const DEFAULT_MEMORY_BUDGET: MemoryBudget = {
 
 // === Phase 2.3: Inference & Model Strategy Types ===
 
-export type ModelProvider = "openai" | "anthropic" | "conway" | "ollama" | "other";
+export type ModelProvider = "openai" | "anthropic" | "google" | "conway" | "ollama" | "other";
 
 export type InferenceTaskType =
   | "agent_turn"
@@ -1243,9 +1350,9 @@ export interface ModelStrategyConfig {
 }
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
-  inferenceModel: "gpt-5.2",
-  lowComputeModel: "gpt-5-mini",
-  criticalModel: "gpt-5-mini",
+  inferenceModel: "gemini-2.5-flash",
+  lowComputeModel: "gemini-2.5-flash",
+  criticalModel: "gemini-2.5-flash",
   maxTokensPerTurn: 4096,
   hourlyBudgetCents: 0,
   sessionBudgetCents: 0,

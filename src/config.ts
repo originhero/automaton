@@ -273,13 +273,24 @@ export function loadConfig(): AutomatonConfig | null {
       ? normalizeBusinessConfig(raw.business)
       : undefined;
 
+    // Environment overrides: INFERENCE_MODEL and CONWAY_SANDBOX_ID take
+    // precedence over config file values (set by OriginHero CLI start).
+    const envInferenceModel = process.env.INFERENCE_MODEL?.trim();
+    const envSandboxId = process.env.CONWAY_SANDBOX_ID?.trim();
+
+    const resolvedSandboxId =
+      envSandboxId ||
+      (typeof raw.sandboxId === "string" ? raw.sandboxId.trim() : "") ||
+      DEFAULT_CONFIG.sandboxId;
+
+    const resolvedInferenceModel =
+      envInferenceModel || raw.inferenceModel || DEFAULT_CONFIG.inferenceModel || "gemini-2.5-flash";
+
     return {
       ...DEFAULT_CONFIG,
       ...raw,
-      sandboxId:
-        typeof raw.sandboxId === "string"
-          ? raw.sandboxId.trim()
-          : DEFAULT_CONFIG.sandboxId,
+      sandboxId: resolvedSandboxId,
+      inferenceModel: resolvedInferenceModel,
       conwayApiKey: apiKey,
       treasuryPolicy,
       modelStrategy,
@@ -416,7 +427,7 @@ export function createConfig(params: {
     anthropicApiKey: params.anthropicApiKey,
     googleApiKey: params.googleApiKey,
     ollamaBaseUrl: params.ollamaBaseUrl,
-    inferenceModel: DEFAULT_CONFIG.inferenceModel || "gpt-5.2",
+    inferenceModel: process.env.INFERENCE_MODEL?.trim() || DEFAULT_CONFIG.inferenceModel || "gemini-2.5-flash",
     maxTokensPerTurn: DEFAULT_CONFIG.maxTokensPerTurn || 4096,
     heartbeatConfigPath:
       DEFAULT_CONFIG.heartbeatConfigPath || "~/.automaton/heartbeat.yml",
