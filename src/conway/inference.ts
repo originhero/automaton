@@ -27,6 +27,7 @@ interface InferenceClientOptions {
   openaiApiKey?: string;
   anthropicApiKey?: string;
   googleApiKey?: string;
+  deepseekApiKey?: string;
   ollamaBaseUrl?: string;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
@@ -37,7 +38,7 @@ type InferenceBackend = "conway" | "openai" | "deepseek" | "anthropic" | "google
 export function createInferenceClient(
   options: InferenceClientOptions,
 ): InferenceClient {
-  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, googleApiKey, ollamaBaseUrl, getModelProvider } = options;
+  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, googleApiKey, deepseekApiKey, ollamaBaseUrl, getModelProvider } = options;
   const httpClient = new ResilientHttpClient({
     baseTimeout: INFERENCE_TIMEOUT_MS,
     retryableStatuses: [429, 500, 502, 503, 504],
@@ -112,12 +113,12 @@ export function createInferenceClient(
     }
 
     const openAiLikeApiUrl =
-      backend === "deepseek" ? apiUrl.replace(/\/$/, "") :
+      backend === "deepseek" ? "https://api.deepseek.com" :
       backend === "openai" ? "https://api.openai.com" :
       backend === "ollama" ? (ollamaBaseUrl as string).replace(/\/$/, "") :
       apiUrl;
     const openAiLikeApiKey =
-      backend === "deepseek" ? (openaiApiKey || apiKey) :
+      backend === "deepseek" ? (deepseekApiKey || openaiApiKey || apiKey) :
       backend === "openai" ? (openaiApiKey as string) :
       backend === "ollama" ? "ollama" :
       apiKey;

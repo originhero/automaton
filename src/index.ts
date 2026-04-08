@@ -217,6 +217,7 @@ Environment:
         openaiApiKey: config.openaiApiKey,
         anthropicApiKey: config.anthropicApiKey,
         googleApiKey,
+        deepseekApiKey,
         ollamaBaseUrl,
         getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
       });
@@ -488,6 +489,7 @@ async function run(): Promise<void> {
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     googleApiKey,
+    deepseekApiKey,
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });

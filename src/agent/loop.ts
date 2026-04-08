@@ -122,6 +122,10 @@ export async function runAgentLoop(
   const modelStrategyConfig: ModelStrategyConfig = {
     ...DEFAULT_MODEL_STRATEGY_CONFIG,
     ...(config.modelStrategy ?? {}),
+    // Sync top-level inferenceModel into modelStrategy so the router
+    // selects the user's configured model (e.g. "deepseek-chat") instead
+    // of the DEFAULT_MODEL_STRATEGY_CONFIG default ("gemini-2.5-flash").
+    ...(config.inferenceModel ? { inferenceModel: config.inferenceModel } : {}),
   };
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
