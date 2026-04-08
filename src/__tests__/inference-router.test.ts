@@ -225,20 +225,25 @@ describe("InferenceRouter", () => {
 
   describe("selectModel", () => {
     it("returns correct model for normal/agent_turn", () => {
+      // User-configured inferenceModel takes priority over routing matrix
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();
-      expect(model!.modelId).toBe("gpt-5.2");
+      expect(model!.modelId).toBe("gemini-2.5-flash");
     });
 
     it("returns cheaper model for low_compute tier", () => {
+      // User-configured inferenceModel (gemini-2.5-flash) is tier low_compute,
+      // so it satisfies the tier check
       const model = router.selectModel("low_compute", "agent_turn");
       expect(model).not.toBeNull();
-      expect(model!.modelId).toBe("gpt-5-mini");
+      expect(model!.modelId).toBe("gemini-2.5-flash");
     });
 
     it("returns minimal model for critical tier", () => {
       const model = router.selectModel("critical", "agent_turn");
       expect(model).not.toBeNull();
+      // gemini-2.5-flash has tierMinimum: "low_compute" which is too high for critical,
+      // so it falls back to the routing matrix candidate gpt-5-mini
       expect(model!.modelId).toBe("gpt-5-mini");
     });
 
@@ -253,10 +258,11 @@ describe("InferenceRouter", () => {
     });
 
     it("skips disabled models and picks next candidate", () => {
-      registry.setEnabled("gpt-5.2", false);
+      // Disable user-configured model AND first routing matrix candidate
+      registry.setEnabled("gemini-2.5-flash", false);
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();
-      expect(model!.modelId).toBe("gpt-5-mini");
+      expect(model!.modelId).toBe("gpt-5.2");
     });
   });
 
@@ -279,13 +285,13 @@ describe("InferenceRouter", () => {
       );
 
       expect(result.content).toBe("Hello!");
-      expect(result.model).toBe("gpt-5.2");
+      expect(result.model).toBe("gemini-2.5-flash");
       expect(result.finishReason).toBe("stop");
 
       // Verify cost was recorded
       const costs = inferenceGetSessionCosts(db, "test-session");
       expect(costs.length).toBe(1);
-      expect(costs[0].model).toBe("gpt-5.2");
+      expect(costs[0].model).toBe("gemini-2.5-flash");
     });
 
     it("computes actualCostCents accurately from token usage", async () => {
@@ -569,7 +575,13 @@ describe("InferenceBudgetTracker", () => {
   });
 
   it("checkBudget allows when no limits are set (0 = unlimited)", () => {
-    const tracker = new InferenceBudgetTracker(db, DEFAULT_MODEL_STRATEGY_CONFIG);
+    const unlimitedConfig = {
+      ...DEFAULT_MODEL_STRATEGY_CONFIG,
+      hourlyBudgetCents: 0,
+      sessionBudgetCents: 0,
+      perCallCeilingCents: 0,
+    };
+    const tracker = new InferenceBudgetTracker(db, unlimitedConfig);
 
     const result = tracker.checkBudget(9999, "gpt-4.1");
     expect(result.allowed).toBe(true);
@@ -749,7 +761,7 @@ describe("Static Model Baseline", () => {
   });
 
   it("all models have valid provider", () => {
-    const validProviders = ["openai", "anthropic", "conway", "other"];
+    const validProviders = ["openai", "anthropic", "google", "deepseek", "conway", "ollama", "other"];
     for (const model of STATIC_MODEL_BASELINE) {
       expect(validProviders).toContain(model.provider);
     }
@@ -954,12 +966,12 @@ describe("Inference DB Helpers", () => {
 
 describe("DEFAULT_MODEL_STRATEGY_CONFIG", () => {
   it("has sensible defaults", () => {
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel).toBe("gpt-5.2");
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.lowComputeModel).toBe("gpt-5-mini");
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.criticalModel).toBe("gpt-5-mini");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel).toBe("gemini-2.5-flash");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.lowComputeModel).toBe("gemini-2.5-flash");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.criticalModel).toBe("gemini-2.5-flash");
     expect(DEFAULT_MODEL_STRATEGY_CONFIG.enableModelFallback).toBe(true);
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.hourlyBudgetCents).toBe(0); // no limit
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.sessionBudgetCents).toBe(0); // no limit
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.hourlyBudgetCents).toBe(10);  // $0.10/hr default
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.sessionBudgetCents).toBe(100); // $1.00/session default
     expect(DEFAULT_MODEL_STRATEGY_CONFIG.perCallCeilingCents).toBe(0); // no limit
   });
 });

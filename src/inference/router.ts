@@ -226,7 +226,24 @@ export class InferenceRouter {
 
     const tierRank = TIER_ORDER[tier] ?? 0;
 
-    // 1. Try routing-matrix candidates
+    // 1. User-configured model takes priority.
+    //    If the user explicitly set inferenceModel in their config and it's
+    //    in the registry and enabled, respect that choice before the routing
+    //    matrix. This ensures custom provider setups (DeepSeek, xAI, etc.)
+    //    actually get used instead of being overridden by the default matrix.
+    const strategy = this.budget.config;
+    if (strategy.inferenceModel) {
+      const userModel = this.registry.get(strategy.inferenceModel);
+      if (userModel && userModel.enabled) {
+        const isFree = userModel.costPer1kInput === 0 && userModel.costPer1kOutput === 0;
+        const tierOk = tierRank >= (TIER_ORDER[userModel.tierMinimum] ?? 0);
+        if (isFree || tierOk) {
+          return userModel;
+        }
+      }
+    }
+
+    // 2. Try routing-matrix candidates
     const preference = this.getPreference(tier, taskType);
     if (preference && preference.candidates.length > 0) {
       for (const candidateId of preference.candidates) {
@@ -237,9 +254,8 @@ export class InferenceRouter {
       }
     }
 
-    // 2. Fall back to user-configured models.
+    // 3. Fall back to user-configured models (lowCompute/critical).
     //    This handles local/Ollama setups where routing-matrix models are absent.
-    const strategy = this.budget.config;
     const fallbackIds: (string | undefined)[] =
       tier === "critical" || tier === "dead"
         ? [strategy.criticalModel, strategy.inferenceModel, strategy.lowComputeModel]

@@ -188,10 +188,16 @@ Environment:
       modelRegistry.initialize();
       const googleApiKey = process.env.GOOGLE_API_KEY || config.googleApiKey;
 
+      // Resolve DeepSeek API key: dedicated env var, or fall back to openaiApiKey
+      // when conwayApiUrl points to DeepSeek (common setup for DeepSeek users).
+      const deepseekApiKey = process.env.DEEPSEEK_API_KEY
+        || (config.conwayApiUrl?.includes("deepseek.com") ? config.openaiApiKey : undefined);
+
       const providerKeys: Record<string, string | undefined> = {
         openai: config.openaiApiKey,
         anthropic: config.anthropicApiKey,
         google: googleApiKey,
+        deepseek: deepseekApiKey,
         conway: apiKey || undefined,
         ollama: ollamaBaseUrl,
       };
@@ -453,10 +459,16 @@ async function run(): Promise<void> {
 
   // Disable models whose provider has no API key configured.
   // This ensures the InferenceRouter skips models it can't actually call.
+  // Resolve DeepSeek API key: dedicated env var, or fall back to openaiApiKey
+  // when conwayApiUrl points to DeepSeek (common setup for DeepSeek users).
+  const deepseekApiKey = process.env.DEEPSEEK_API_KEY
+    || (config.conwayApiUrl?.includes("deepseek.com") ? config.openaiApiKey : undefined);
+
   const providerKeys: Record<string, string | undefined> = {
     openai: config.openaiApiKey,
     anthropic: config.anthropicApiKey,
     google: googleApiKey,
+    deepseek: deepseekApiKey,
     conway: apiKey || undefined,
     ollama: ollamaBaseUrl,
   };

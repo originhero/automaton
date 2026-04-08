@@ -138,6 +138,21 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
     parameterStyle: "max_completion_tokens",
     enabled: true,
   },
+  // ─── DeepSeek ──────────────────────────────────────────────────
+  {
+    modelId: "deepseek-chat",
+    provider: "deepseek",
+    displayName: "DeepSeek Chat (V3)",
+    tierMinimum: "low_compute",
+    costPer1kInput: 1,     // $0.14/M (cache miss) — very cheap
+    costPer1kOutput: 3,    // $0.28/M
+    maxTokens: 8192,
+    contextWindow: 64000,
+    supportsTools: true,
+    supportsVision: false,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
   // ─── Google Gemini ──────────────────────────────────────────────
   {
     modelId: "gemini-2.5-pro",

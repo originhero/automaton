@@ -32,7 +32,7 @@ interface InferenceClientOptions {
   getModelProvider?: (modelId: string) => string | undefined;
 }
 
-type InferenceBackend = "conway" | "openai" | "anthropic" | "google" | "ollama";
+type InferenceBackend = "conway" | "openai" | "deepseek" | "anthropic" | "google" | "ollama";
 
 export function createInferenceClient(
   options: InferenceClientOptions,
@@ -112,10 +112,12 @@ export function createInferenceClient(
     }
 
     const openAiLikeApiUrl =
+      backend === "deepseek" ? apiUrl.replace(/\/$/, "") :
       backend === "openai" ? "https://api.openai.com" :
       backend === "ollama" ? (ollamaBaseUrl as string).replace(/\/$/, "") :
       apiUrl;
     const openAiLikeApiKey =
+      backend === "deepseek" ? (openaiApiKey || apiKey) :
       backend === "openai" ? (openaiApiKey as string) :
       backend === "ollama" ? "ollama" :
       apiKey;
@@ -385,6 +387,7 @@ function resolveInferenceBackend(
     const provider = keys.getModelProvider(model);
     if (provider === "ollama" && keys.ollamaBaseUrl) return "ollama";
     if (provider === "anthropic" && keys.anthropicApiKey) return "anthropic";
+    if (provider === "deepseek") return "deepseek";
     if (provider === "openai" && keys.openaiApiKey) return "openai";
     if (provider === "google" && keys.googleApiKey) return "google";
     if (provider === "conway") return "conway";
@@ -393,6 +396,7 @@ function resolveInferenceBackend(
 
   // Heuristic fallback (model not in registry yet)
   if (keys.anthropicApiKey && /^claude/i.test(model)) return "anthropic";
+  if (/^deepseek/i.test(model)) return "deepseek";
   if (keys.openaiApiKey && /^(gpt-[3-9]|gpt-4|gpt-5|o[1-9][-\s.]|o[1-9]$|chatgpt)/i.test(model)) return "openai";
   if (keys.googleApiKey && /^gemini/i.test(model)) return "google";
   return "conway";
@@ -404,7 +408,7 @@ async function chatViaOpenAiCompatible(params: {
   body: Record<string, unknown>;
   apiUrl: string;
   apiKey: string;
-  backend: "conway" | "openai" | "ollama";
+  backend: "conway" | "openai" | "deepseek" | "ollama";
   httpClient: ResilientHttpClient;
 }): Promise<InferenceResponse> {
   const resp = await params.httpClient.request(`${params.apiUrl}/v1/chat/completions`, {
@@ -412,7 +416,7 @@ async function chatViaOpenAiCompatible(params: {
     headers: {
       "Content-Type": "application/json",
       Authorization:
-        params.backend === "openai" || params.backend === "ollama"
+        params.backend === "openai" || params.backend === "ollama" || params.backend === "deepseek"
           ? `Bearer ${params.apiKey}`
           : params.apiKey,
     },
