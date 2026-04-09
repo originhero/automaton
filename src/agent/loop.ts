@@ -135,6 +135,7 @@ export async function runAgentLoop(
     const { discoverOllamaModels } = await import("../ollama/discover.js");
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
+  logger.info(`Budget config: hourly=${modelStrategyConfig.hourlyBudgetCents}c, session=${modelStrategyConfig.sessionBudgetCents}c`);
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
 
   // Rate limiter config from env vars: ORIGINHERO_MAX_RPM, ORIGINHERO_MAX_RPH
@@ -160,6 +161,14 @@ export async function runAgentLoop(
       }
       if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
         process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
+      }
+      if (config.googleApiKey && !process.env.GOOGLE_API_KEY) {
+        process.env.GOOGLE_API_KEY = config.googleApiKey;
+      }
+      const deepseekKey = process.env.DEEPSEEK_API_KEY
+        || (config.conwayApiUrl?.includes("deepseek.com") ? (config as any).deepseekApiKey : undefined);
+      if (deepseekKey && !process.env.DEEPSEEK_API_KEY) {
+        process.env.DEEPSEEK_API_KEY = deepseekKey;
       }
       // Conway Compute API is OpenAI-compatible. Use it as fallback when no
       // direct OpenAI key is available. The conwayApiKey is always present
@@ -635,6 +644,21 @@ export async function runAgentLoop(
         },
         (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
       );
+
+      // Budget exceeded — sleep until the hourly window resets instead of spinning
+      if (
+        routerResult.inputTokens === 0 &&
+        routerResult.outputTokens === 0 &&
+        routerResult.content.startsWith("Budget exceeded")
+      ) {
+        log(config, `[BUDGET] ${routerResult.content}`);
+        const sleepMs = 5 * 60_000; // 5 minutes
+        db.setKV("sleep_until", new Date(Date.now() + sleepMs).toISOString());
+        db.setAgentState("sleeping");
+        onStateChange?.("sleeping");
+        running = false;
+        continue;
+      }
 
       // Build a compatible response for the rest of the loop
       const response = {

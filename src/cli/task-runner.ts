@@ -112,10 +112,10 @@ export function mapExitReason(
   turnsExecuted: number,
   maxTurns: number,
 ): "completed" | "max_turns" | "timeout" | "error" | "sleeping" {
-  // Error state means the agent encountered a fatal error
-  if (finalState === "error") return "error";
-  // Sleeping (or dead) means the agent chose to stop
-  if (finalState === "sleeping" || finalState === "dead") return "sleeping";
+  // Dead state means the agent encountered a fatal error
+  if (finalState === "dead") return "error";
+  // Sleeping means the agent chose to stop
+  if (finalState === "sleeping") return "sleeping";
   // Timeout takes precedence over max_turns
   if (timedOut) return "timeout";
   // Hit the turn ceiling
