@@ -1,0 +1,107 @@
+{
+  "name": "OriginHero-Automaton",
+  "genesisPrompt": "You are OriginHero-Automaton, a sovereign AI agent running in local mode. You operate autonomously, manage your own resources, and execute tasks on behalf of your creator. Think carefully before acting. Always explain your reasoning.",
+  "creatorAddress": "0x0000000000000000000000000000000000000000",
+  "registeredWithConway": false,
+  "sandboxId": "",
+  "conwayApiUrl": "",
+  "conwayApiKey": "",
+  "googleApiKey": "AIzaSyAKQ-f3I179Jf-qiWcWp9S2SOLoLO8dpqk",
+  "inferenceModel": "gemini-2.5-flash",
+  "maxTokensPerTurn": 8192,
+  "heartbeatConfigPath": "~/.automaton/heartbeat.yml",
+  "dbPath": "~/.automaton/state.db",
+  "logLevel": "info",
+  "walletAddress": "0x0000000000000000000000000000000000000000",
+  "version": "0.2.1",
+  "skillsDir": "~/.automaton/skills",
+  "maxChildren": 3,
+  "maxTurnsPerCycle": 25,
+  "chainType": "evm",
+  "treasuryPolicy": {
+    "dailyTransferLimitCents": 50000,
+    "singleTransferLimitCents": 10000,
+    "reserveBalanceCents": 5000,
+    "maxDailyInferenceCents": 50000
+  },
+  "modelStrategy": {
+    "reasoningModel": "gemini-2.5-pro",
+    "fastModel": "gemini-2.5-flash",
+    "lowComputeModel": "gemini-2.5-flash"
+  },
+  "business": {
+    "name": "Starlumon AI",
+    "description": "AI Ethics & Quality Assurance Platform — analyzes customer interactions for quality, empathy, and compliance",
+    "repo": {
+      "url": "https://github.com/ipuertoparra/starlumonai",
+      "branch": "main",
+      "accessTokenEnvVar": "GITHUB_TOKEN",
+      "localPath": "~/business-repo/starlumonai"
+    },
+    "domains": [
+      {
+        "fqdn": "www.starlumon.ai",
+        "role": "primary",
+        "sslManaged": true
+      },
+      {
+        "fqdn": "starlumon.ai",
+        "role": "alias",
+        "sslManaged": true
+      }
+    ],
+    "servers": [
+      {
+        "id": "hetzner-prod",
+        "name": "Hetzner Production VPS",
+        "provider": "hetzner",
+        "type": "vps",
+        "host": "",
+        "sshPort": 22,
+        "sshUser": "root",
+        "sshKeyEnvVar": "SSH_KEY_PATH",
+        "role": "production",
+        "deployMethod": "docker",
+        "deployPath": "/opt/starlumon"
+      }
+    ],
+    "services": [
+      {
+        "name": "supabase",
+        "type": "database",
+        "apiKeyEnvVar": "SUPABASE_URL",
+        "notes": "PostgreSQL + pgvector + Auth"
+      },
+      {
+        "name": "stripe",
+        "type": "payments",
+        "apiKeyEnvVar": "STRIPE_SECRET_KEY",
+        "notes": "Interaction-based billing model"
+      },
+      {
+        "name": "resend",
+        "type": "email",
+        "apiKeyEnvVar": "RESEND_API_KEY"
+      },
+      {
+        "name": "deepgram",
+        "type": "other",
+        "apiKeyEnvVar": "DEEPGRAM_API_KEY",
+        "notes": "Audio transcription for call analysis"
+      },
+      {
+        "name": "sentry",
+        "type": "monitoring",
+        "apiKeyEnvVar": "SENTRY_DSN"
+      }
+    ],
+    "stack": {
+      "backend": "fastapi",
+      "frontend": "nextjs",
+      "languages": ["python", "typescript"],
+      "database": "postgresql (supabase)",
+      "containerization": "docker-compose",
+      "reverseProxy": "caddy"
+    }
+  }
+}
