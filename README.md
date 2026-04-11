@@ -124,6 +124,26 @@ node packages/cli/dist/index.js logs --tail 20
 node packages/cli/dist/index.js fund 5.00
 ```
 
+### Testing
+
+Run the test suite with `npx vitest run` (or `npm test`). The full suite
+should complete in **under 30 seconds**. If it hangs, see the triage
+command in [`CONTRIBUTING.md`](../CONTRIBUTING.md#test-hygiene-rules).
+
+**Test hygiene is enforced by convention**, not the type system. Before
+writing new tests, read the [Test hygiene rules](../CONTRIBUTING.md#test-hygiene-rules)
+in the repo-root `CONTRIBUTING.md`. Summary of what MUST be cleaned up
+in `afterEach`:
+
+- DB connections (`db.close()`)
+- HTTP servers (`server.close()`)
+- `setInterval` / `setTimeout` handles (`clearInterval` / `clearTimeout`)
+- Spawned child processes (`child.kill("SIGTERM")`)
+- Heartbeat daemons (`daemon.stop()`)
+
+Also see the **timer trap** and **tiktoken trap** sections — common
+causes of hangs specific to this runtime.
+
 ## Project Structure
 
 ```

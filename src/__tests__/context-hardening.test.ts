@@ -67,6 +67,45 @@ describe("estimateTokens", () => {
   it("handles empty string as zero tokens", () => {
     expect(estimateTokens("")).toBe(0);
   });
+
+  /**
+   * Day 2 regression — hanging test triage (see CONTRIBUTING.md
+   * "Text-processing traps"). js-tiktoken has pathological O(n²)-ish
+   * performance on highly repetitive long strings like `"x".repeat(500_000)`.
+   * A single call used to hang for >10 minutes, blocking the entire
+   * test suite.
+   *
+   * `estimateTokens` short-circuits inputs over MAX_TIKTOKEN_INPUT_CHARS
+   * (10,000) to the character-based estimate. This test locks that
+   * behavior in — any refactor that removes the short-circuit will
+   * either hang (if tiktoken is still called) or return a different
+   * value (if the fallback is broken).
+   */
+  it("short-circuits pathological 500k-char input without hanging", () => {
+    const huge = "x".repeat(500_000);
+    const start = Date.now();
+    const result = estimateTokens(huge);
+    const elapsed = Date.now() - start;
+
+    // Must complete in well under 100ms — the fallback is O(1) after
+    // `.length / 4`. If this test takes >1s, tiktoken is being called.
+    expect(elapsed).toBeLessThan(100);
+    // And return the char-based fallback exactly.
+    expect(result).toBe(Math.ceil(500_000 / 4));
+  });
+
+  it("still uses tiktoken for inputs under the threshold", () => {
+    // Below the threshold, tiktoken is used — the returned count should
+    // be stable and reasonable for normal text. This is the other side
+    // of the contract: short-circuit ONLY for pathological sizes.
+    const normalText = "The quick brown fox jumps over the lazy dog.";
+    const result = estimateTokens(normalText);
+    // Tiktoken typically produces ~10-12 tokens for this; char-based
+    // would be Math.ceil(44/4) = 11. The key property is "> 0 and
+    // reasonable", not an exact count — tiktoken versions can shift.
+    expect(result).toBeGreaterThan(0);
+    expect(result).toBeLessThan(30);
+  });
 });
 
 // ─── truncateToolResult ────────────────────────────────────────

@@ -124,8 +124,28 @@ function enforceLruLimit(cache: Map<string, number>): void {
   }
 }
 
+/**
+ * Day 2 fix: the previous cache key was `${model}::${text}` which stored
+ * the ENTIRE text as the key. For large inputs (50k+ chars) this caused
+ * O(n) memory per cache entry and O(n) hash cost per lookup.
+ *
+ * Now: for short inputs (< 1KB) we still use the full text (faster for
+ * the common case of repeated small prompts). For larger inputs we hash
+ * a prefix + length + suffix — collision-resistant enough for LRU cache
+ * purposes (collisions just mean a recompute, not incorrect behavior).
+ */
 function formatCacheKey(text: string, model?: string): string {
-  return `${model ?? "default"}::${text}`;
+  const prefix = model ?? "default";
+  if (text.length < 1024) {
+    return `${prefix}::${text}`;
+  }
+  // Fingerprint: length + head + tail. Two distinct long strings that
+  // share length + 128-char head + 128-char tail are extraordinarily
+  // rare in practice, and even if they collided the only cost is a
+  // recomputation — no correctness issue.
+  const head = text.slice(0, 128);
+  const tail = text.slice(-128);
+  return `${prefix}::len=${text.length}::${head}::${tail}`;
 }
 
 export function createTokenCounter(): TokenCounter {

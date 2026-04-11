@@ -30,12 +30,31 @@ export type { TokenBudget };
 export { DEFAULT_TOKEN_BUDGET };
 
 /**
+ * Upper bound for running js-tiktoken on a single string.
+ *
+ * Day 2 fix (hanging test triage): tiktoken's `encode()` has pathological
+ * O(n²)-ish performance on highly repetitive long strings (e.g.
+ * `"x".repeat(500_000)`). A single call could run for 10+ minutes on such
+ * input, hanging the agent loop or the test suite. For texts over this
+ * threshold we fall back to the character-based estimate, which is
+ * accurate enough for budget decisions — the 1:4 ratio is stable for
+ * any text length and over-estimating is safe for budget enforcement.
+ */
+const MAX_TIKTOKEN_INPUT_CHARS = 10_000;
+
+/**
  * Estimate token count from text length.
  * Conservative estimate: ~4 characters per token for English text.
  */
 export function estimateTokens(text: string): number {
   const content = text ?? "";
   const legacyEstimate = Math.ceil(content.length / 4);
+
+  // Short-circuit huge inputs to avoid tiktoken's O(n²) worst-case.
+  if (content.length > MAX_TIKTOKEN_INPUT_CHARS) {
+    return legacyEstimate;
+  }
+
   try {
     if (!tokenCounter) {
       tokenCounter = createTokenCounter();
