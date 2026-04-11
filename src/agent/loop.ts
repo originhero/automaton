@@ -23,6 +23,8 @@ import type {
   SpendTrackerInterface,
   InputSource,
   ModelStrategyConfig,
+  SleepReason,
+  LastError,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
@@ -43,6 +45,7 @@ import {
   markInboxFailed,
   resetInboxToReceived,
   consumeNextWakeEvent,
+  getActiveGoals,
 } from "../state/database.js";
 import type { InboxMessageRow } from "../state/database.js";
 import { ulid } from "ulid";
@@ -66,11 +69,42 @@ import { EventStream } from "../memory/event-stream.js";
 import { KnowledgeStore } from "../memory/knowledge-store.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
+import type { ToolOutcome } from "./circuit-breaker.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_REPETITIVE_TURNS = 3;
+
+/**
+ * H1 fix (audit follow-up Gap 5): capture provider API keys into the
+ * registry's in-memory cache, then delete them from `process.env` so
+ * child processes spawned by the agent can't exfiltrate credentials.
+ *
+ * Exported purely to make the scrub contract executable in tests —
+ * a unit test can invoke this in isolation without booting the full
+ * agent loop and assert both halves of the contract:
+ *   1. Registry cache is populated (captureApiKeys called)
+ *   2. process.env no longer has the provider keys (delete happened)
+ *
+ * Exceptions kept in env: CONWAY_API_KEY (other subsystems read it
+ * directly) and OPENAI_BASE_URL (non-secret endpoint URL).
+ */
+export const ENV_KEYS_KEPT_AFTER_SCRUB = new Set([
+  "CONWAY_API_KEY",
+  "OPENAI_BASE_URL",
+]);
+
+export function captureAndScrubProviderKeys(
+  registry: { captureApiKeys(): void; getCapturedEnvVarNames(): string[] },
+): void {
+  registry.captureApiKeys();
+  for (const envVarName of registry.getCapturedEnvVarNames()) {
+    if (ENV_KEYS_KEPT_AFTER_SCRUB.has(envVarName)) continue;
+    delete process.env[envVarName];
+  }
+}
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -190,6 +224,11 @@ export async function runAgentLoop(
         "inference-providers.json",
       );
       const registry = ProviderRegistry.fromConfig(providersPath);
+
+      // H1 fix: capture API keys into registry's in-memory cache, then scrub
+      // them from process.env so child processes (exec tool, spawn_child,
+      // etc.) can't exfiltrate credentials via `env`, `printenv`, or `export`.
+      captureAndScrubProviderKeys(registry);
 
       // If OPENAI_BASE_URL was set (Conway fallback), update the default
       // provider's baseUrl so the OpenAI client points to Conway Compute.
@@ -389,6 +428,15 @@ export async function runAgentLoop(
   let idleToolTurns = 0;
   // blockedGoalTurns removed — replaced by immediate sleep + exponential backoff
 
+  // Circuit breaker: detects tool-stuck, spend anomalies, unproductive writes
+  const circuitBreaker = new CircuitBreaker({
+    maxToolFailures: config.circuitBreaker?.maxToolFailures ?? 3,
+    maxTurnSpendCents: config.circuitBreaker?.maxTurnSpendCents ?? 50,
+    maxWritesWithoutExec: config.circuitBreaker?.maxWritesWithoutExec ?? 5,
+    spendWindowTurns: config.circuitBreaker?.spendWindowTurns ?? 5,
+    spendWindowMinCents: config.circuitBreaker?.spendWindowMinCents ?? 20,
+  });
+
   // Drain any stale wake events from before this loop started,
   // so they don't re-wake the agent after its first sleep.
   let drained = 0;
@@ -416,9 +464,10 @@ export async function runAgentLoop(
     db,
   });
 
-  // Transition to running
+  // Transition to running — clear any stale sleep metadata
   db.setAgentState("running");
   onStateChange?.("running");
+  clearSleepMeta(db);
 
   log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
 
@@ -609,6 +658,17 @@ export async function runAgentLoop(
         }
       }
 
+      // Persist active goals for the dashboard status API
+      try {
+        const activeGoals = getActiveGoals(db.raw);
+        const goalsSnapshot = activeGoals.map((g) => ({
+          id: g.id,
+          title: g.title,
+          status: g.status,
+        }));
+        db.setKV("pending_goals", JSON.stringify(goalsSnapshot));
+      } catch { /* non-fatal */ }
+
       if (planModeController) {
         try {
           const todoMd = generateTodoMd(db.raw);
@@ -654,6 +714,7 @@ export async function runAgentLoop(
         log(config, `[BUDGET] ${routerResult.content}`);
         const sleepMs = 5 * 60_000; // 5 minutes
         db.setKV("sleep_until", new Date(Date.now() + sleepMs).toISOString());
+        setSleepMeta(db, "budget_exceeded", routerResult.content);
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
@@ -773,6 +834,7 @@ export async function runAgentLoop(
         db.setKV("blocked_goal_backoff", String(backoffMs));
         log(config, `[LOOP] create_goal BLOCKED — sleeping ${Math.round(backoffMs / 1000)}s (backoff).`);
         db.setKV("sleep_until", new Date(Date.now() + backoffMs).toISOString());
+        setSleepMeta(db, "blocked_goal", `Goal blocked — backoff ${Math.round(backoffMs / 1000)}s.`);
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
@@ -817,6 +879,7 @@ export async function runAgentLoop(
           };
           loopWarningPattern = null;
           lastToolPatterns = [];
+          setSleepMeta(db, "loop_detected", `Repetitive pattern: ${currentPattern}`);
           db.setAgentState("sleeping");
           onStateChange?.("sleeping");
           running = false;
@@ -871,6 +934,7 @@ export async function runAgentLoop(
       const sleepTool = turn.toolCalls.find((tc) => tc.name === "sleep");
       if (sleepTool && !sleepTool.error) {
         log(config, "[SLEEP] Agent chose to sleep.");
+        setSleepMeta(db, "manual", "Agent chose to sleep.");
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
@@ -898,6 +962,48 @@ export async function runAgentLoop(
       ]);
       const didMutate = turn.toolCalls.some((tc) => MUTATING_TOOLS.has(tc.name));
 
+      // ── Circuit Breaker Check ──
+      {
+        const toolOutcomes: ToolOutcome[] = turn.toolCalls.map((tc) => ({
+          name: tc.name,
+          error: tc.error ?? null,
+          costCents: 0,
+        }));
+        const cbEvent = circuitBreaker.processTurn(
+          toolOutcomes,
+          turn.costCents ?? 0,
+          didMutate,
+        );
+        if (cbEvent) {
+          circuitBreaker.escalate(db, cbEvent);
+          log(config, `[CIRCUIT BREAKER] ${cbEvent.severity}: ${cbEvent.message}`);
+
+          if (cbEvent.severity === "critical") {
+            const sleepMs = 5 * 60_000;
+            pendingInput = {
+              content:
+                `CIRCUIT BREAKER TRIPPED (${cbEvent.type}): ${cbEvent.message} ` +
+                `Forcing sleep. On next wake, change your approach completely.`,
+              source: "system",
+            };
+            db.setKV("sleep_until", new Date(Date.now() + sleepMs).toISOString());
+            setSleepMeta(db, "circuit_breaker", `Circuit breaker: ${cbEvent.message}`);
+            db.setAgentState("sleeping");
+            onStateChange?.("sleeping");
+            running = false;
+            break;
+          }
+          if (!pendingInput) {
+            pendingInput = {
+              content:
+                `CIRCUIT BREAKER WARNING (${cbEvent.type}): ${cbEvent.message} ` +
+                `Adjust your approach to avoid forced sleep.`,
+              source: "system",
+            };
+          }
+        }
+      }
+
       if (!currentInput && !didMutate) {
         idleTurnCount++;
         if (idleTurnCount >= MAX_IDLE_TURNS) {
@@ -919,6 +1025,7 @@ export async function runAgentLoop(
       if (running && cycleTurnCount >= maxCycleTurns) {
         log(config, `[CYCLE LIMIT] ${cycleTurnCount} turns reached (max: ${maxCycleTurns}). Forcing sleep.`);
         db.setKV("sleep_until", new Date(Date.now() + 120_000).toISOString());
+        setSleepMeta(db, "cycle_limit", `${cycleTurnCount} turns reached (max: ${maxCycleTurns}). Will wake in 120s.`);
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
@@ -938,15 +1045,21 @@ export async function runAgentLoop(
           "sleep_until",
           new Date(Date.now() + 60_000).toISOString(),
         );
+        setSleepMeta(db, "idle", "Nothing to do — will wake in 60s.");
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
       }
 
+      // Turn succeeded — reset error state
+      if (consecutiveErrors > 0) {
+        clearErrors(db);
+      }
       consecutiveErrors = 0;
     } catch (err: any) {
       consecutiveErrors++;
       log(config, `[ERROR] Turn failed: ${err.message} (attempt ${consecutiveErrors})`);
+      pushError(db, err.message || "Unknown error");
 
       // Rate limiting and backoff for inference errors is handled by
       // InferenceRateLimiter in the router. The loop only counts errors
@@ -974,18 +1087,66 @@ export async function runAgentLoop(
           config,
           `[FATAL] ${MAX_CONSECUTIVE_ERRORS} consecutive errors. Sleeping.`,
         );
-        db.setAgentState("sleeping");
-        onStateChange?.("sleeping");
         db.setKV(
           "sleep_until",
           new Date(Date.now() + 300_000).toISOString(),
         );
+        setSleepMeta(db, "consecutive_errors", `${consecutiveErrors} consecutive errors. Last: ${(err.message || "unknown").slice(0, 200)}`);
+        db.setAgentState("sleeping");
+        onStateChange?.("sleeping");
         running = false;
       }
     }
   }
 
   log(config, `[LOOP END] Agent loop finished. State: ${db.getAgentState()}`);
+}
+
+// ─── Sleep Metadata Helpers ──────────────────────────────────
+
+function setSleepMeta(
+  db: AutomatonDatabase,
+  reason: SleepReason,
+  detail: string,
+): void {
+  db.setKV("sleep_reason", reason);
+  db.setKV("sleep_detail", detail);
+}
+
+function clearSleepMeta(db: AutomatonDatabase): void {
+  db.deleteKV("sleep_reason");
+  db.deleteKV("sleep_detail");
+  db.deleteKV("last_errors");
+}
+
+const MAX_TRACKED_ERRORS = 5;
+
+function pushError(db: AutomatonDatabase, message: string): void {
+  let errors: LastError[] = [];
+  try {
+    const raw = db.getKV("last_errors");
+    if (raw) errors = JSON.parse(raw);
+  } catch { /* fresh list */ }
+
+  // Deduplicate: if the last error has the same message, increment count
+  const last = errors[0];
+  if (last && last.message === message) {
+    last.count++;
+    last.timestamp = new Date().toISOString();
+  } else {
+    errors.unshift({ message, timestamp: new Date().toISOString(), count: 1 });
+  }
+
+  // Keep only the most recent entries
+  if (errors.length > MAX_TRACKED_ERRORS) {
+    errors = errors.slice(0, MAX_TRACKED_ERRORS);
+  }
+
+  db.setKV("last_errors", JSON.stringify(errors));
+}
+
+function clearErrors(db: AutomatonDatabase): void {
+  db.deleteKV("last_errors");
 }
 
 // ─── Helpers ───────────────────────────────────────────────────

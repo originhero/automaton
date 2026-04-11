@@ -157,21 +157,41 @@ export function restoreSession(
 /**
  * Capture current session state from the database KV store.
  *
- * KNOWN LIMITATION: kvState is always empty because AutomatonDatabase does not
- * expose a listKV() method. Keys written by the agent during its run are stored
- * in the DB but cannot be enumerated here. The workdir is captured explicitly
- * via the `__workdir__` sentinel key. A future AutomatonDatabase.listKV() API
- * would allow full KV state capture.
+ * C7 fix — now uses AutomatonDatabase.listKV() to enumerate ALL KV entries
+ * written during the agent's run, so Paperclip can restore full session
+ * context between task cycles.
+ *
+ * We exclude a set of transient / infrastructure keys that should NOT
+ * cross session boundaries (sleep state, error rings, orchestrator cache,
+ * lock state, inference budget counters).
  */
+const EXCLUDED_KV_PREFIXES = [
+  "sleep_",
+  "last_errors",
+  "pending_goals",
+  "orchestrator.",
+  "blocked_goal_backoff",
+  "session_id",
+  "inference_budget.",
+  "rate_limit.",
+];
+
+function shouldExcludeKey(key: string): boolean {
+  if (key === "__workdir__") return true; // captured separately
+  return EXCLUDED_KV_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
 export function captureSession(
   db: AutomatonDatabase,
   turns: SerializedTurn[],
 ): TaskInputSession {
-  // Gather all KV entries (excluding internal keys)
+  const allKV = db.listKV();
   const kvState: Record<string, string> = {};
-  // The database interface doesn't expose a listKV, so we track keys set
-  // during session restore plus any the agent wrote. For now we emit the
-  // workdir and any keys the agent stored during its run.
+  for (const [key, value] of Object.entries(allKV)) {
+    if (!shouldExcludeKey(key)) {
+      kvState[key] = value;
+    }
+  }
   const workdir = db.getKV("__workdir__") ?? null;
 
   return {

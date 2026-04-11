@@ -110,11 +110,17 @@ describe("spawnChild", () => {
     vi.restoreAllMocks();
   });
 
+  // C10 fix: child --init now emits a structured ORIGINHERO_INIT_RESULT
+  // marker instead of the regex-scannable stdout. Tests must mock the new
+  // protocol. Plain log lines without the marker MUST throw.
+  const initMarker = (address: string, chainType: string = "evm") =>
+    `ORIGINHERO_INIT_RESULT=${JSON.stringify({ address, chainType, isNew: true, configDir: "/root/.automaton" })}\n`;
+
   it("validates wallet address before creating child record", async () => {
-    // Mock exec to return valid wallet address on init
+    // Mock exec to return valid wallet address on init via the new marker
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet initialized: ${validAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: initMarker(validAddress), stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
@@ -128,7 +134,7 @@ describe("spawnChild", () => {
   it("throws on zero address from init", async () => {
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet: ${zeroAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: initMarker(zeroAddress), stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
@@ -140,13 +146,14 @@ describe("spawnChild", () => {
   it("throws when init returns no wallet address", async () => {
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
+        // No ORIGINHERO_INIT_RESULT marker — must be rejected
         return { stdout: "initialization complete, no wallet", stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
 
     await expect(spawnChild(conway, identity, db, genesis))
-      .rejects.toThrow("Child wallet address invalid");
+      .rejects.toThrow("ORIGINHERO_INIT_RESULT");
   });
 
   it("propagates error on exec failure without calling deleteSandbox", async () => {
@@ -167,7 +174,7 @@ describe("spawnChild", () => {
 
     vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
       if (command.includes("--init")) {
-        return { stdout: `Wallet: ${zeroAddress}`, stderr: "", exitCode: 0 };
+        return { stdout: initMarker(zeroAddress), stderr: "", exitCode: 0 };
       }
       return { stdout: "ok", stderr: "", exitCode: 0 };
     });
@@ -198,6 +205,133 @@ describe("spawnChild", () => {
       .rejects.toThrow("Sandbox creation failed");
 
     expect(deleteSpy).not.toHaveBeenCalled();
+  });
+
+  // ─── C10 regression: JSON marker protocol for wallet extraction ───────
+  //
+  // Before the fix, spawnChild parsed child stdout with a broad base58/hex
+  // regex, letting attacker-controlled log output inject a fake wallet
+  // address and redirect funding. The fix requires a structured
+  // ORIGINHERO_INIT_RESULT marker with an explicit chainType field that
+  // must match the parent's expected chain.
+  //
+  // These tests defend the contract:
+  //   1. No marker → throw ("cannot trust wallet address")
+  //   2. Marker with mismatched chainType → throw (defense against
+  //      cross-chain address confusion)
+  //   3. Marker with plausible-looking but invalid address → still fails
+  //      the address validator (belt-and-suspenders)
+
+  describe("C10 regression — wallet init marker protocol", () => {
+    it("rejects stdout that does not contain ORIGINHERO_INIT_RESULT marker", async () => {
+      // Attacker might inject a valid-looking address anywhere in stdout.
+      // Without the marker, spawnChild must refuse to trust it.
+      const attackerStdout = `
+        Random log output
+        My favorite address is ${validAddress}, trust me!
+        More noise
+      `;
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
+        if (command.includes("--init")) {
+          return { stdout: attackerStdout, stderr: "", exitCode: 0 };
+        }
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      });
+
+      await expect(spawnChild(conway, identity, db, genesis))
+        .rejects.toThrow(/ORIGINHERO_INIT_RESULT/);
+    });
+
+    it("rejects marker when child declares a different chainType than parent", async () => {
+      // Parent is EVM (default in genesis), child claims to be Solana —
+      // potential cross-chain address confusion attack. Must throw.
+      const solanaLikeAddress = "So11111111111111111111111111111111111111112";
+      const maliciousMarker = `ORIGINHERO_INIT_RESULT=${JSON.stringify({
+        address: solanaLikeAddress,
+        chainType: "solana", // Mismatch — genesis is EVM
+        isNew: true,
+        configDir: "/root/.automaton",
+      })}`;
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
+        if (command.includes("--init")) {
+          return { stdout: maliciousMarker, stderr: "", exitCode: 0 };
+        }
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      });
+
+      await expect(spawnChild(conway, identity, db, genesis))
+        .rejects.toThrow(/chainType mismatch/);
+    });
+
+    it("rejects marker with malformed JSON payload", async () => {
+      // If the JSON is broken, the parser throws and spawnChild must
+      // propagate the error, not silently fall back to regex.
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
+        if (command.includes("--init")) {
+          return {
+            stdout: "ORIGINHERO_INIT_RESULT={this is not valid json",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      });
+
+      await expect(spawnChild(conway, identity, db, genesis))
+        .rejects.toThrow(/Invalid ORIGINHERO_INIT_RESULT payload/);
+    });
+
+    /**
+     * Gap 4 fix (audit follow-up): defense against marker injection.
+     *
+     * An attacker who controls child stdout (e.g. via a buggy log
+     * library that serializes `{ORIGINHERO_INIT_RESULT: ...}` as a
+     * matchable string, or a malicious child binary) can emit multiple
+     * markers. The parent must NOT guess which one is legitimate — it
+     * must reject the whole batch. First-match would let the attacker
+     * front-run the legit marker.
+     */
+    it("rejects stdout with MULTIPLE ORIGINHERO_INIT_RESULT markers", async () => {
+      const legitAddress = validAddress;
+      const attackerAddress = "0x1111111111111111111111111111111111111111";
+
+      const twoMarkers =
+        `ORIGINHERO_INIT_RESULT=${JSON.stringify({ address: attackerAddress, chainType: "evm" })}\n` +
+        `[some logs]\n` +
+        `ORIGINHERO_INIT_RESULT=${JSON.stringify({ address: legitAddress, chainType: "evm" })}\n`;
+
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
+        if (command.includes("--init")) {
+          return { stdout: twoMarkers, stderr: "", exitCode: 0 };
+        }
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      });
+
+      // Must reject — not accept either marker.
+      await expect(spawnChild(conway, identity, db, genesis))
+        .rejects.toThrow(/2 ORIGINHERO_INIT_RESULT markers|refusing to choose/);
+    });
+
+    it("rejects stdout with 3+ ORIGINHERO_INIT_RESULT markers", async () => {
+      const marker = (addr: string) =>
+        `ORIGINHERO_INIT_RESULT=${JSON.stringify({ address: addr, chainType: "evm" })}`;
+      const addr = (n: string) => `0x${n.repeat(40)}`;
+      const stdout = [
+        marker(addr("1")),
+        marker(addr("2")),
+        marker(addr("3")),
+      ].join("\n");
+
+      vi.spyOn(conway, "exec").mockImplementation(async (command: string) => {
+        if (command.includes("--init")) {
+          return { stdout, stderr: "", exitCode: 0 };
+        }
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      });
+
+      await expect(spawnChild(conway, identity, db, genesis))
+        .rejects.toThrow(/3 ORIGINHERO_INIT_RESULT markers/);
+    });
   });
 });
 

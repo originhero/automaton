@@ -88,13 +88,20 @@ Environment:
       }
     } catch {}
     const { chainIdentity, isNew } = await getWallet(initChainType);
-    logger.info(
-      JSON.stringify({
-        address: chainIdentity.address,
-        isNew,
-        configDir: getAutomatonDir(),
-      }),
-    );
+
+    // C10 fix: emit a structured, clearly-delimited JSON line so the parent
+    // spawn process can extract the wallet address reliably. The previous
+    // approach regex-scanned stdout for base58-like strings, which could
+    // be spoofed by attacker-controlled log output.
+    const initResult = {
+      address: chainIdentity.address,
+      chainType: initChainType || "evm",
+      isNew,
+      configDir: getAutomatonDir(),
+    };
+    // Write directly to stdout, bypassing the logger, so no formatting can
+    // interfere with the marker. The parent parses this exact line.
+    process.stdout.write(`ORIGINHERO_INIT_RESULT=${JSON.stringify(initResult)}\n`);
     process.exit(0);
   }
 
@@ -257,12 +264,22 @@ Environment:
             | { recordInferenceCost(p: { promptTokens: number; completionTokens: number; model: string; provider: string }): void }
             | undefined;
 
+          // H3 fix: wire PolicyEngine + SpendTracker in task mode (Paperclip).
+          // Previously these were omitted, disabling ALL security policies for
+          // any Paperclip task invocation. Same behaviour as the main run().
+          const taskTreasuryPolicy = taskConfig.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
+          const taskRules = createDefaultRules(taskTreasuryPolicy);
+          const taskPolicyEngine = new PolicyEngine(options.db.raw, taskRules);
+          const taskSpendTracker = new SpendTracker(options.db.raw);
+
           await runAgentLoop({
             identity: options.identity,
             config: taskConfig,
             db: options.db,
             conway: options.conway,
             inference: options.inference,
+            policyEngine: taskPolicyEngine,
+            spendTracker: taskSpendTracker,
             onTurnComplete: (turn) => {
               collectedTurns.push(turn);
               options.onTurn(turn);

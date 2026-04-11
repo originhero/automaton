@@ -56,15 +56,15 @@ const DEFAULT_EMERGENCY_STOP_CREDITS = 100;
 const DEFAULT_TIER_DEFAULTS: Record<ModelTier, TierDefault> = {
   reasoning: {
     preferredProvider: "openai",
-    fallbackOrder: ["groq", "together"],
+    fallbackOrder: ["google", "groq", "together"],
   },
   fast: {
-    preferredProvider: "groq",
-    fallbackOrder: ["openai", "together", "local"],
+    preferredProvider: "google",
+    fallbackOrder: ["groq", "openai", "together", "local"],
   },
   cheap: {
-    preferredProvider: "groq",
-    fallbackOrder: ["together", "local", "openai"],
+    preferredProvider: "google",
+    fallbackOrder: ["groq", "together", "local", "openai"],
   },
 };
 
@@ -205,6 +205,51 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
     enabled: false,
   },
   {
+    id: "google",
+    name: "Google Gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    apiKeyEnvVar: "GOOGLE_API_KEY",
+    models: [
+      {
+        id: "gemini-2.5-pro",
+        tier: "reasoning",
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+        costPerInputToken: 1.25,
+        costPerOutputToken: 10.0,
+        supportsTools: true,
+        supportsVision: true,
+        supportsStreaming: true,
+      },
+      {
+        id: "gemini-2.5-flash",
+        tier: "fast",
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+        costPerInputToken: 0.15,
+        costPerOutputToken: 0.60,
+        supportsTools: true,
+        supportsVision: true,
+        supportsStreaming: true,
+      },
+      {
+        id: "gemini-2.5-flash",
+        tier: "cheap",
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+        costPerInputToken: 0.15,
+        costPerOutputToken: 0.60,
+        supportsTools: true,
+        supportsVision: true,
+        supportsStreaming: true,
+      },
+    ],
+    maxRequestsPerMinute: 1000,
+    maxTokensPerMinute: 4_000_000,
+    priority: 1,
+    enabled: true,
+  },
+  {
     id: "local",
     name: "Local (Ollama/vLLM)",
     baseUrl: "http://localhost:11434/v1",
@@ -245,6 +290,12 @@ export class ProviderRegistry {
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
   private readonly emergencyStopCredits: number;
+  /**
+   * H1 fix — in-memory API key cache. Populated via `captureApiKeys()` so
+   * that the caller can then scrub `process.env` and prevent child
+   * processes from exfiltrating credentials.
+   */
+  private readonly keyCache = new Map<string, string>();
 
   constructor(
     providers: ProviderConfig[],
@@ -443,7 +494,37 @@ export class ProviderRegistry {
     };
   }
 
+  /**
+   * H1 fix — capture all currently-set provider API keys into the in-memory
+   * cache. After calling this, the caller should scrub the env vars from
+   * `process.env` so child processes don't inherit them.
+   */
+  captureApiKeys(): void {
+    for (const provider of this.providers) {
+      const value = process.env[provider.apiKeyEnvVar];
+      if (typeof value === "string" && value.length > 0) {
+        this.keyCache.set(provider.apiKeyEnvVar, value);
+      }
+    }
+  }
+
+  /**
+   * List the env var names this registry has captured keys for, so the
+   * caller can scrub them from `process.env`.
+   */
+  getCapturedEnvVarNames(): string[] {
+    return Array.from(this.keyCache.keys());
+  }
+
   private resolveApiKey(provider: ProviderConfig): string {
+    // Prefer the in-memory cache (populated via captureApiKeys) so we don't
+    // need env vars at call time — H1 fix prevents child processes from
+    // exfiltrating credentials.
+    const cached = this.keyCache.get(provider.apiKeyEnvVar);
+    if (cached && cached.length > 0) {
+      return cached;
+    }
+
     const configured = process.env[provider.apiKeyEnvVar];
     if (typeof configured === "string" && configured.length > 0) {
       return configured;
@@ -453,7 +534,10 @@ export class ProviderRegistry {
       return "local";
     }
 
-    return `missing-${provider.apiKeyEnvVar.toLowerCase()}`;
+    // H11 fix: throw a clear error instead of returning a placeholder string.
+    throw new Error(
+      `Provider "${provider.id}" requires API key: set ${provider.apiKeyEnvVar} in your environment`,
+    );
   }
 
   private isProviderActive(provider: ProviderConfig): boolean {

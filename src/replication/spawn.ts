@@ -161,14 +161,54 @@ export async function spawnChild(
 
     // Initialize child wallet (on the CHILD sandbox)
     const initResult = await childConway.exec("node /root/automaton/dist/index.js --init 2>&1", 60_000);
-    // Extract child wallet address - support both EVM (0x...) and Solana (base58)
     const stdout = initResult.stdout || "";
-    const evmMatch = stdout.match(/0x[a-fA-F0-9]{40}/);
-    const solanaMatch = stdout.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
     const parentChainType = (identity as any).chainType || "evm";
-    const childWallet = parentChainType === "solana"
-      ? (solanaMatch ? solanaMatch[0] : "")
-      : (evmMatch ? evmMatch[0] : "");
+
+    // C10 fix: extract the structured JSON line emitted by the child's --init
+    // instead of regex-scanning stdout. The previous regex-based approach
+    // matched ANY base58-like string in stdout, letting attacker-controlled
+    // log output inject a false wallet address.
+    //
+    // Gap 4 fix (audit follow-up): fail closed on MORE than one marker.
+    // A child that emits multiple ORIGINHERO_INIT_RESULT lines is either
+    // buggy (accidental logger output that looks like a marker) or
+    // malicious (trying to confuse the parent about which payload to
+    // trust). Both cases must reject — we do NOT guess which marker is
+    // legitimate.
+    let childWallet = "";
+    const markerMatches = [...stdout.matchAll(/^ORIGINHERO_INIT_RESULT=(.+)$/gm)];
+    if (markerMatches.length === 0) {
+      throw new Error(
+        "Child --init did not emit ORIGINHERO_INIT_RESULT marker. Cannot trust wallet address.",
+      );
+    }
+    if (markerMatches.length > 1) {
+      throw new Error(
+        `Child --init emitted ${markerMatches.length} ORIGINHERO_INIT_RESULT markers; refusing to choose. ` +
+          `Cannot trust wallet address.`,
+      );
+    }
+    try {
+      const parsed = JSON.parse(markerMatches[0][1]) as {
+        address: string;
+        chainType: string;
+      };
+      // Verify the child's declared chain type matches what the parent expects
+      if (parsed.chainType !== parentChainType) {
+        throw new Error(
+          `Child chainType mismatch: parent=${parentChainType}, child=${parsed.chainType}`,
+        );
+      }
+      childWallet = parsed.address;
+    } catch (parseErr) {
+      // Re-throw chainType mismatch errors verbatim so they remain matchable
+      // by tests and by operator grep. Only wrap JSON.parse failures.
+      const msg = (parseErr as Error).message;
+      if (msg.startsWith("Child chainType mismatch")) throw parseErr;
+      throw new Error(
+        `Invalid ORIGINHERO_INIT_RESULT payload from child: ${msg}`,
+      );
+    }
 
     if (!isValidWalletAddress(childWallet, parentChainType)) {
       throw new Error(`Child wallet address invalid: ${childWallet}`);
@@ -296,11 +336,46 @@ async function spawnChildLegacy(
 
     const initResult = await childConway.exec("node /root/automaton/dist/index.js --init 2>&1", 60_000);
     const legacyParentChainType = genesis.chainType || (identity as any).chainType || "evm";
-    const legacyEvmMatch = (initResult.stdout || "").match(/0x[a-fA-F0-9]{40}/);
-    const legacySolMatch = (initResult.stdout || "").match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);
-    const childWallet = legacyParentChainType === "solana"
-      ? (legacySolMatch ? legacySolMatch[0] : "")
-      : (legacyEvmMatch ? legacyEvmMatch[0] : "");
+    const legacyStdout = initResult.stdout || "";
+
+    // C10 follow-up fix + Gap 4: the legacy path previously used regex
+    // scanning of child stdout for base58-like strings, which allowed
+    // wallet injection. Now parses the same structured
+    // ORIGINHERO_INIT_RESULT marker as the modern path AND fails closed
+    // if more than one marker is present.
+    let childWallet = "";
+    const legacyMarkerMatches = [
+      ...legacyStdout.matchAll(/^ORIGINHERO_INIT_RESULT=(.+)$/gm),
+    ];
+    if (legacyMarkerMatches.length === 0) {
+      throw new Error(
+        "Child --init did not emit ORIGINHERO_INIT_RESULT marker. Cannot trust wallet address.",
+      );
+    }
+    if (legacyMarkerMatches.length > 1) {
+      throw new Error(
+        `Child --init emitted ${legacyMarkerMatches.length} ORIGINHERO_INIT_RESULT markers; refusing to choose. ` +
+          `Cannot trust wallet address.`,
+      );
+    }
+    try {
+      const parsed = JSON.parse(legacyMarkerMatches[0][1]) as {
+        address: string;
+        chainType: string;
+      };
+      if (parsed.chainType !== legacyParentChainType) {
+        throw new Error(
+          `Child chainType mismatch: parent=${legacyParentChainType}, child=${parsed.chainType}`,
+        );
+      }
+      childWallet = parsed.address;
+    } catch (parseErr) {
+      const msg = (parseErr as Error).message;
+      if (msg.startsWith("Child chainType mismatch")) throw parseErr;
+      throw new Error(
+        `Invalid ORIGINHERO_INIT_RESULT payload from child: ${msg}`,
+      );
+    }
 
     if (!isValidWalletAddress(childWallet, legacyParentChainType)) {
       throw new Error(`Child wallet address invalid: ${childWallet}`);

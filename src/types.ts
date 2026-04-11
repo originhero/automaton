@@ -78,6 +78,14 @@ export interface AutomatonConfig {
   chainType?: ChainType;
   /** The digital business this automaton operates autonomously. */
   business?: BusinessConfig;
+  /** Circuit breaker thresholds (overrides defaults) */
+  circuitBreaker?: {
+    maxToolFailures?: number;
+    maxTurnSpendCents?: number;
+    maxWritesWithoutExec?: number;
+    spendWindowTurns?: number;
+    spendWindowMinCents?: number;
+  };
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -198,6 +206,43 @@ export interface StackConfig {
 }
 
 export const DEFAULT_BUSINESS_CONFIG: BusinessConfig | undefined = undefined;
+
+// ─── Sleep Metadata ──────────────────────────────────────────────
+
+export type SleepReason =
+  | "cycle_limit"
+  | "consecutive_errors"
+  | "no_credits"
+  | "rate_limited"
+  | "manual"
+  | "idle"
+  | "budget_exceeded"
+  | "loop_detected"
+  | "circuit_breaker"
+  | "blocked_goal";
+
+export type SetupPriority = "critical" | "recommended" | "optional";
+
+export interface SetupIssue {
+  id: string;
+  label: string;
+  status: "invalid" | "missing" | "not_connected" | "exhausted" | "ok";
+  priority: SetupPriority;
+  action: string;
+  settingsPath: string;
+}
+
+export interface LastError {
+  message: string;
+  timestamp: string;
+  count: number;
+}
+
+export interface PendingGoal {
+  id: string;
+  title: string;
+  status: string;
+}
 
 // ─── Agent State ─────────────────────────────────────────────────
 
@@ -765,6 +810,12 @@ export interface AutomatonDatabase {
   getKV(key: string): string | undefined;
   setKV(key: string, value: string): void;
   deleteKV(key: string): void;
+  /**
+   * C7 fix — list all KV entries (optionally filtered by prefix).
+   * Used by task-runner.captureSession() to snapshot agent state
+   * between Paperclip cycles.
+   */
+  listKV(prefix?: string): Record<string, string>;
 
   // Skills
   getSkills(enabledOnly?: boolean): Skill[];

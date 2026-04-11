@@ -8,7 +8,7 @@
  * OriginHero Phase 1: LocalConwayClient — replaces Conway Cloud sandboxes.
  */
 
-import { execSync, exec as execCallback } from "child_process";
+import { execSync, exec as execCallback, execFile as execFileCallback } from "child_process";
 import { promisify } from "util";
 import net from "net";
 import { randomUUID } from "crypto";
@@ -16,7 +16,38 @@ import type { ExecResult, PortInfo, CreateSandboxOptions, SandboxInfo } from "..
 import { createLogger } from "../observability/logger.js";
 
 const execAsync = promisify(execCallback);
+const execFileAsync = promisify(execFileCallback);
 const logger = createLogger("docker-sandbox");
+
+/**
+ * C5 fix — run a command inside a Docker container without passing it
+ * through the parent shell. The command string is still interpreted by
+ * `sh -c` *inside* the container (so users can still use pipes, redirects,
+ * etc.) but the parent-process command line itself is argv-based, so
+ * nothing in the command string can escape into the host shell.
+ *
+ * The ONLY arguments that get interpolated are containerId and extraDockerArgs,
+ * which are validated by validateId() before reaching this function.
+ */
+async function runInContainer(
+  containerId: string,
+  command: string,
+  opts: { timeout?: number; extraDockerArgs?: string[] } = {},
+): Promise<{ stdout: string; stderr: string }> {
+  validateId(containerId);
+  const args = [
+    "exec",
+    ...(opts.extraDockerArgs ?? []),
+    containerId,
+    "sh",
+    "-c",
+    command, // passed as a single argv entry — no host-shell interpolation
+  ];
+  return execFileAsync("docker", args, {
+    timeout: opts.timeout ?? 30_000,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+}
 
 /**
  * Validate a file path to prevent shell injection.
@@ -148,20 +179,19 @@ export class DockerSandbox {
 
   /**
    * Execute a command in the own sandbox container.
+   * C5 fix: use execFile + argv array so the host shell never interprets
+   * the command string. Null bytes, `$()`, backticks, etc. stay inside the
+   * container.
    */
   async exec(command: string, timeout?: number): Promise<ExecResult> {
     if (!this.ownContainerId) {
       throw new Error("Own sandbox not initialized. Call initOwnSandbox() first.");
     }
 
-    const timeoutMs = timeout || 30_000;
-    const escapedCommand = command.replace(/'/g, "'\\''");
-
     try {
-      const { stdout, stderr } = await execAsync(
-        `docker exec ${this.ownContainerId} sh -c '${escapedCommand}'`,
-        { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
-      );
+      const { stdout, stderr } = await runInContainer(this.ownContainerId, command, {
+        timeout: timeout || 30_000,
+      });
       return { stdout: stdout || "", stderr: stderr || "", exitCode: 0 };
     } catch (err: any) {
       return {
@@ -382,13 +412,11 @@ export class DockerSandbox {
 
     return {
       exec: async (command: string, timeout?: number) => {
-        const timeoutMs = timeout || 30_000;
-        const escapedCommand = command.replace(/'/g, "'\\''");
+        // C5 fix: execFile with argv array — host shell never parses the command
         try {
-          const { stdout, stderr } = await execAsync(
-            `docker exec ${container.containerId} sh -c '${escapedCommand}'`,
-            { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
-          );
+          const { stdout, stderr } = await runInContainer(container.containerId, command, {
+            timeout: timeout || 30_000,
+          });
           return { stdout: stdout || "", stderr: stderr || "", exitCode: 0 };
         } catch (err: any) {
           return {
@@ -402,20 +430,23 @@ export class DockerSandbox {
         validatePath(filePath);
         const dir = filePath.substring(0, filePath.lastIndexOf("/"));
         if (dir) {
-          await execAsync(
-            `docker exec ${container.containerId} mkdir -p '${dir}'`,
-          ).catch(() => {});
+          await execFileAsync("docker", [
+            "exec", container.containerId, "mkdir", "-p", dir,
+          ]).catch(() => {});
         }
+        // Pipe base64 content via stdin instead of interpolating into the command
         const encoded = Buffer.from(content).toString("base64");
-        await execAsync(
-          `docker exec ${container.containerId} sh -c "echo '${encoded}' | base64 -d > '${filePath}'"`,
+        await runInContainer(
+          container.containerId,
+          `echo '${encoded}' | base64 -d > "$TARGET"`,
+          { extraDockerArgs: ["-e", `TARGET=${filePath}`] },
         );
       },
       readFile: async (filePath: string) => {
         validatePath(filePath);
-        const { stdout } = await execAsync(
-          `docker exec ${container.containerId} cat '${filePath}'`,
-        );
+        const { stdout } = await execFileAsync("docker", [
+          "exec", container.containerId, "cat", filePath,
+        ], { maxBuffer: 10 * 1024 * 1024 });
         return stdout;
       },
     };

@@ -27,8 +27,8 @@ const logger = createLogger("tools");
 
 // ─── Path Confinement ─────────────────────────────────────────
 // write_file is restricted to the sandbox home directory tree.
-// The sandbox home is /root for both local and remote execution.
-const SANDBOX_HOME = "/root";
+// Use the actual home directory (macOS: /Users/x, Linux: /home/x or /root).
+const SANDBOX_HOME = process.env.HOME || "/root";
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
@@ -184,7 +184,14 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
-        // Block reads of sensitive files (wallet, env, config secrets)
+        // M4 fix: use isProtectedFile() so read_file is consistent with
+        // write_file / edit_own_file and enforces the SAME protected-path
+        // rules (not just basename matching, but full-path policy engine).
+        const { isProtectedFile } = await import("../self-mod/code.js");
+        if (isProtectedFile(filePath)) {
+          return "Blocked: Cannot read protected file. This protects credentials, policy rules, and audit code from exfiltration.";
+        }
+        // Keep the legacy basename-based checks as a safety net
         const basename = filePath.split("/").pop() || "";
         const sensitiveFiles = ["wallet.json", ".env", "automaton.json"];
         const sensitiveExtensions = [".key", ".pem"];

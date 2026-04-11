@@ -339,6 +339,26 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     return row?.value;
   };
 
+  /**
+   * C7 fix — list all KV entries (optionally filtered by prefix) so callers
+   * like task-runner's captureSession() can snapshot arbitrary agent state
+   * between Paperclip cycles. Returns an object for easy JSON serialization.
+   */
+  const listKV = (prefix?: string): Record<string, string> => {
+    const rows = prefix
+      ? (db
+          .prepare("SELECT key, value FROM kv WHERE key LIKE ?")
+          .all(`${prefix}%`) as Array<{ key: string; value: string }>)
+      : (db
+          .prepare("SELECT key, value FROM kv")
+          .all() as Array<{ key: string; value: string }>);
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      result[row.key] = row.value;
+    }
+    return result;
+  };
+
   // ─── Skills ─────────────────────────────────────────────────
 
   const getSkills = (enabledOnly?: boolean): Skill[] => {
@@ -541,6 +561,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     setKV,
     deleteKV,
     deleteKVReturning,
+    listKV,
     getSkills,
     getSkillByName,
     upsertSkill,
