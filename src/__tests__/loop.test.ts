@@ -222,6 +222,10 @@ describe("Agent Loop", () => {
   });
 
   it("consecutive errors trigger sleep", async () => {
+    // Use fake timers so the rate limiter's internal sleep() calls
+    // (exponential backoff on inference failures) resolve instantly.
+    vi.useFakeTimers();
+
     // Create an inference client that always throws
     const failingInference = new MockInferenceClient([]);
     failingInference.chat = async () => {
@@ -232,13 +236,22 @@ describe("Agent Loop", () => {
     const consoleSpy2 = vi.spyOn(console, "log").mockImplementation(() => {});
     const consoleSpy3 = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    await runAgentLoop({
+    // Run the loop with fake timers — advance time whenever the loop awaits
+    const loopPromise = runAgentLoop({
       identity,
       config: { ...config, logLevel: "debug" },
       db,
       conway,
       inference: failingInference,
     });
+
+    // Advance timers repeatedly until the loop completes.
+    // Each error triggers rate limiter backoff sleeps.
+    for (let i = 0; i < 50; i++) {
+      await vi.advanceTimersByTimeAsync(120_000);
+    }
+
+    await loopPromise;
 
     // After 5 consecutive errors, should be sleeping
     expect(db.getAgentState()).toBe("sleeping");
@@ -247,6 +260,7 @@ describe("Agent Loop", () => {
     consoleSpy.mockRestore();
     consoleSpy2.mockRestore();
     consoleSpy3.mockRestore();
+    vi.useRealTimers();
   });
 
   it("financial state cached fallback on API failure", async () => {
