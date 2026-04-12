@@ -729,6 +729,34 @@ Lineage: ${lineageSummary}${upstreamLine}
 --- END STATUS ---`,
   );
 
+  // Circuit breaker alerts: surface any recently fired circuit breakers
+  // so the agent sees them and changes approach before wasting more credits.
+  // The circuit-breaker module writes the latest event to this KV key on trip.
+  try {
+    const cbLatestRaw = db.getKV("circuit_breaker_latest");
+    if (cbLatestRaw) {
+      const event = JSON.parse(cbLatestRaw) as {
+        type: string;
+        severity: string;
+        message: string;
+        timestamp: string;
+      };
+      const eventTime = new Date(event.timestamp).getTime();
+      const ageMs = Date.now() - eventTime;
+      const FRESH_WINDOW_MS = 30 * 60_000; // 30 minutes
+      if (Number.isFinite(eventTime) && ageMs >= 0 && ageMs < FRESH_WINDOW_MS) {
+        const ageMins = Math.floor(ageMs / 60_000);
+        sections.push(
+          `⚠ CIRCUIT BREAKER TRIPPED: ${event.type} (${event.severity}) — ${ageMins}m ago
+${event.message}
+Change your approach NOW. Do not repeat the pattern that tripped this breaker.`,
+        );
+      }
+    }
+  } catch {
+    // Malformed KV entry — fail open, do not inject
+  }
+
   const orchestratorStatus = getOrchestratorStatus(db.raw);
   if (orchestratorStatus) {
     sections.push(
