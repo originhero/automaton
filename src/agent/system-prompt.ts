@@ -652,6 +652,53 @@ Your chain type is ${chainType}.`,
     );
   }
 
+  // Layer 4.5: Business Context (the digital business this agent operates)
+  // Emits the non-secret metadata from config.business so the agent knows
+  // which business its tools are acting on. Secrets (env var values, SSH
+  // keys) are deliberately NOT emitted — only references to what exists.
+  if (config.business) {
+    const biz = config.business;
+    const bizLines: string[] = [`--- BUSINESS CONTEXT ---`];
+    bizLines.push(`Name: ${biz.name}`);
+    if (biz.description) {
+      bizLines.push(`Description: ${biz.description}`);
+    }
+    bizLines.push(
+      `Repo: ${biz.repo.url}${biz.repo.branch ? ` (${biz.repo.branch})` : ""}`,
+    );
+    if (biz.domains.length > 0) {
+      const domainList = biz.domains
+        .map((d) => `${d.fqdn}${d.role ? ` [${d.role}]` : ""}`)
+        .join(", ");
+      bizLines.push(`Domains: ${domainList}`);
+    }
+    for (const s of biz.servers) {
+      const role = s.role ? ` [${s.role}]` : "";
+      const host = s.host ? ` @ ${s.host}` : "";
+      bizLines.push(`Server: ${s.name} — ${s.provider} ${s.type}${host}${role}`);
+    }
+    if (biz.services && biz.services.length > 0) {
+      const svcList = biz.services
+        .map((svc) => `${svc.name} (${svc.type})`)
+        .join(", ");
+      bizLines.push(`Services: ${svcList}`);
+    }
+    if (biz.stack) {
+      const stackParts: string[] = [];
+      if (biz.stack.backend) stackParts.push(`backend=${biz.stack.backend}`);
+      if (biz.stack.frontend) stackParts.push(`frontend=${biz.stack.frontend}`);
+      if (biz.stack.database) stackParts.push(`db=${biz.stack.database}`);
+      if (biz.stack.languages && biz.stack.languages.length > 0) {
+        stackParts.push(`lang=${biz.stack.languages.join(",")}`);
+      }
+      if (stackParts.length > 0) {
+        bizLines.push(`Stack: ${stackParts.join(", ")}`);
+      }
+    }
+    bizLines.push(`--- END BUSINESS CONTEXT ---`);
+    sections.push(bizLines.join("\n"));
+  }
+
   // Layer 5: Active skill instructions (untrusted content with trust boundary markers)
   if (skills && skills.length > 0) {
     const skillInstructions = getActiveSkillInstructions(skills);
